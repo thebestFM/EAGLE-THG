@@ -8,8 +8,8 @@
     "train_predict_ratio": 0.3
   },
   "time": {
-    "id": "time_cfg1_mrr",
-    "dir": "results_time_tkg_single/ICEWS14/seed42/r210529791eed_topk40_mw5-15-30-60_ed96_hd192_bs4096_ebs384_neg8_samgroup_nsq6000_nss42_tpr0.3_abs1r0_gatechannel_rank1_lossmargin",
+    "id": "time_cfg2_mrr",
+    "dir": "results_time_tkg_single/ICEWS14/seed42/r9eb5b85515d8_topk30_mw5-15-30_ed96_hd192_bs4096_ebs384_neg6_samgroup_nsq6000_nss42_tpr0.3_abs1r0_gatechannel_rank1_lossmargin",
     "batch_size": 4096,
     "eval_batch_size": 384,
     "eval_neg_chunk": 6000,
@@ -22,10 +22,10 @@
     "selection_metric": "mrr",
     "lr": 0.001,
     "weight_decay": 0.00005,
-    "train_num_neg": 8,
+    "train_num_neg": 6,
     "hard_neg_ratio": 0.5,
-    "topk": 40,
-    "multi_windows": "5,15,30,60",
+    "topk": 30,
+    "multi_windows": "5,15,30",
     "event_dim": 96,
     "hidden_dim": 192,
     "dropout": 0.1,
@@ -59,7 +59,7 @@
   "hybrid": {
     "focus_metric": "MRR",
     "hybrid_select_split": "test",
-    "hybrid_preset_indices": "8",
+    "hybrid_preset_indices": "7",
     "rescue_topk": 100,
     "rescue_min_pos_rank": 1,
     "rescue_max_pos_rank": 100,
