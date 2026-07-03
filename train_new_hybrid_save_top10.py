@@ -374,7 +374,29 @@ def build_train_matrix(data, args, time_dir, structure_dir):
     return X, y, group
 
 
+def validate_lgbm_args(args):
+    if int(args.lgbm_n_estimators) <= 0:
+        raise ValueError("--lgbm_n_estimators must be > 0")
+    if float(args.lgbm_learning_rate) <= 0.0:
+        raise ValueError("--lgbm_learning_rate must be > 0")
+    if int(args.lgbm_num_leaves) <= 1:
+        raise ValueError("--lgbm_num_leaves must be > 1")
+    if int(args.lgbm_max_depth) == 0 or int(args.lgbm_max_depth) < -1:
+        raise ValueError("--lgbm_max_depth must be -1 or a positive integer")
+    if int(args.lgbm_min_child_samples) <= 0:
+        raise ValueError("--lgbm_min_child_samples must be > 0")
+    if float(args.lgbm_reg_lambda) < 0.0 or float(args.lgbm_reg_alpha) < 0.0:
+        raise ValueError("--lgbm_reg_lambda and --lgbm_reg_alpha must be >= 0")
+    if float(args.lgbm_min_split_gain) < 0.0:
+        raise ValueError("--lgbm_min_split_gain must be >= 0")
+    if not 0.0 < float(args.lgbm_subsample) <= 1.0:
+        raise ValueError("--lgbm_subsample must be in (0, 1]")
+    if not 0.0 < float(args.lgbm_colsample_bytree) <= 1.0:
+        raise ValueError("--lgbm_colsample_bytree must be in (0, 1]")
+
+
 def fit_lgbm_ranker(X, y, group, args):
+    validate_lgbm_args(args)
     try:
         import lightgbm as lgb
     except Exception as exc:

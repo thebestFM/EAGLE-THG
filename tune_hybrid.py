@@ -150,11 +150,11 @@ def apply_config(hargs, config, mapping):
 
 def suggest_hybrid_params(trial):
     return {
-        "hybrid_train_topk": trial.suggest_categorical("hybrid_train_topk", [50, 100, 200, 500, -1]),
-        "lgbm_n_estimators": trial.suggest_categorical("lgbm_n_estimators", [16, 32, 64, 128, 256]),
-        "lgbm_learning_rate": trial.suggest_float("lgbm_learning_rate", 0.005, 0.08, log=True),
-        "lgbm_num_leaves": trial.suggest_categorical("lgbm_num_leaves", [15, 31, 63, 127]),
-        "lgbm_max_depth": trial.suggest_categorical("lgbm_max_depth", [4, 6, 8, 10, 12, -1]),
+        "hybrid_train_topk": trial.suggest_categorical("hybrid_train_topk", [20, 50, 100, 200, 500, -1]),
+        "lgbm_n_estimators": trial.suggest_categorical("lgbm_n_estimators", [1, 2, 4, 8, 16, 32, 64, 128]),
+        "lgbm_learning_rate": trial.suggest_float("lgbm_learning_rate", 0.001, 0.08, log=True),
+        "lgbm_num_leaves": trial.suggest_categorical("lgbm_num_leaves", [3, 7, 15, 31, 63, 127]),
+        "lgbm_max_depth": trial.suggest_categorical("lgbm_max_depth", [2, 4, 6, 8, 10, 12, -1]),
         "lgbm_min_child_samples": trial.suggest_int("lgbm_min_child_samples", 20, 300, log=True),
         "lgbm_reg_lambda": trial.suggest_float("lgbm_reg_lambda", 1e-3, 10.0, log=True),
         "lgbm_reg_alpha": trial.suggest_float("lgbm_reg_alpha", 1e-5, 1.0, log=True),
