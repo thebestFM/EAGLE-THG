@@ -75,6 +75,7 @@ def suggest_params(trial):
         "rescue_topk": int(rescue_topk),
         "rescue_min_pos_rank": 1,
         "rescue_max_pos_rank": int(rescue_topk),
+        "rescue_exclude_top10": False,
         "b_mode": "continuous",
         "b_continuous_alpha": trial.suggest_float("b_continuous_alpha", 1e-5, 1e-2, log=True),
     }
