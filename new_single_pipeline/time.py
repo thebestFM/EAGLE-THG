@@ -802,6 +802,23 @@ class TKGTimeMixer(nn.Module):
             return inputs
         raise ValueError(f"history input tuple must have 5 or 6 tensors, got {len(inputs)}")
 
+    @staticmethod
+    def _expand_source_node_features(features, batch_size, num_candidates):
+        if features is None:
+            return None
+        if features.shape[0] == batch_size * num_candidates:
+            return features
+        if features.shape[0] != batch_size:
+            raise ValueError(
+                "source_node_features must have batch_size or batch_size*num_candidates rows; "
+                f"got {features.shape[0]} for batch_size={batch_size}, num_candidates={num_candidates}"
+            )
+        return (
+            features.unsqueeze(1)
+            .expand(batch_size, num_candidates, features.shape[-1])
+            .reshape(batch_size * num_candidates, features.shape[-1])
+        )
+
     def _entity_embed(self, node_ids, device, node_features=None):
         node_ids = torch.as_tensor(node_ids, dtype=torch.long, device=device).reshape(-1)
         node_ids = node_ids.clamp(min=0, max=self.num_nodes)
@@ -932,6 +949,11 @@ class TKGTimeMixer(nn.Module):
             .reshape(-1)
         )
         dst_node_flat = np.asarray(candidate_nodes, dtype=np.int64).reshape(-1)
+        source_node_features = self._expand_source_node_features(
+            source_node_features,
+            batch_size,
+            num_candidates,
+        )
         src_node_emb = self._entity_embed(src_node_expanded, query_rel.device, source_node_features)
         dst_node_emb = self._entity_embed(dst_node_flat, query_rel.device, candidate_node_features)
         scores = self.predictor(
@@ -972,6 +994,11 @@ class TKGTimeMixer(nn.Module):
             .reshape(-1)
         )
         dst_node_flat = np.asarray(candidate_nodes, dtype=np.int64).reshape(-1)
+        source_node_features = self._expand_source_node_features(
+            source_node_features,
+            batch_size,
+            num_candidates,
+        )
         src_node_emb = self._entity_embed(src_node_expanded, query_rel.device, source_node_features)
         dst_node_emb = self._entity_embed(dst_node_flat, query_rel.device, candidate_node_features)
         scores = self.predictor(
@@ -1691,49 +1718,66 @@ def node_features_to_tensor(nodes, current_t, store, args, device):
     return torch.from_numpy(feats.astype(np.float32, copy=False)).to(device)
 
 
-def flattened_candidate_features(source_nodes, candidate_nodes, current_t, store, args, device):
+def node_features_to_numpy(nodes, current_t, store, args):
     if not use_node_features(args):
-        return None, None
-    candidate_nodes = np.asarray(candidate_nodes, dtype=np.int64)
-    batch_size, num_candidates = candidate_nodes.shape
-    src_flat = (
-        np.asarray(source_nodes, dtype=np.int64)
-        .reshape(batch_size, 1)
-        .repeat(num_candidates, axis=1)
-        .reshape(-1)
-    )
-    dst_flat = candidate_nodes.reshape(-1)
-    return (
-        node_features_to_tensor(src_flat, current_t, store, args, device),
-        node_features_to_tensor(dst_flat, current_t, store, args, device),
-    )
+        return None
+    return store.get_node_features(nodes, current_t).astype(np.float32, copy=False)
 
 
-def histories_to_tensors(nodes, current_t, store, args, device, num_rels, num_nodes):
+def history_inputs_to_tensors(inputs, device):
+    return tuple(torch.from_numpy(x).to(device) for x in inputs)
+
+
+def concat_history_inputs(items):
+    if not items:
+        return ()
+    return tuple(np.concatenate(parts, axis=0) for parts in zip(*items))
+
+
+def take_history_rows(inputs, rows):
+    rows = np.asarray(rows, dtype=np.int64).reshape(-1)
+    return tuple(np.ascontiguousarray(x[rows]) for x in inputs)
+
+
+def histories_to_numpy(nodes, current_t, store, args, num_rels, num_nodes):
     deltas, rels, neigh, event_times, mask = store.get_recent(
         nodes,
         current_t,
         num_rels,
         num_nodes,
     )
-
     if use_node_features(args):
         node_features = store.get_node_features(neigh.reshape(-1), current_t)
         node_features = node_features.reshape(neigh.shape[0], neigh.shape[1], -1)
-        return (
-            torch.from_numpy(deltas).to(device),
-            torch.from_numpy(rels).to(device),
-            torch.from_numpy(neigh).to(device),
-            torch.from_numpy(event_times).to(device),
-            torch.from_numpy(mask).to(device),
-            torch.from_numpy(node_features).to(device),
-        )
+        return deltas, rels, neigh, event_times, mask, node_features
+    return deltas, rels, neigh, event_times, mask
+
+
+def flattened_candidate_features(source_nodes, candidate_nodes, current_t, store, args, device):
+    if not use_node_features(args):
+        return None, None
+    candidate_nodes = np.asarray(candidate_nodes, dtype=np.int64)
+    dst_flat = candidate_nodes.reshape(-1)
     return (
-        torch.from_numpy(deltas).to(device),
-        torch.from_numpy(rels).to(device),
-        torch.from_numpy(neigh).to(device),
-        torch.from_numpy(event_times).to(device),
-        torch.from_numpy(mask).to(device),
+        node_features_to_tensor(source_nodes, current_t, store, args, device),
+        node_features_to_tensor(dst_flat, current_t, store, args, device),
+    )
+
+
+def flattened_candidate_features_numpy(source_nodes, candidate_nodes, current_t, store, args):
+    if not use_node_features(args):
+        return None, None
+    candidate_nodes = np.asarray(candidate_nodes, dtype=np.int64)
+    return (
+        node_features_to_numpy(source_nodes, current_t, store, args),
+        node_features_to_numpy(candidate_nodes.reshape(-1), current_t, store, args),
+    )
+
+
+def histories_to_tensors(nodes, current_t, store, args, device, num_rels, num_nodes):
+    return history_inputs_to_tensors(
+        histories_to_numpy(nodes, current_t, store, args, num_rels, num_nodes),
+        device,
     )
 
 
@@ -1815,6 +1859,163 @@ def score_candidate_nodes(
     )
 
 
+def materialize_train_batch(batch, candidates, current_t, t_norm, store, args, num_rels, num_nodes, dataset_end_t, time_span):
+    src_inputs = histories_to_numpy(batch[:, 0], current_t, store, args, num_rels, num_nodes)
+    dst_inputs = histories_to_numpy(
+        candidates.reshape(-1),
+        current_t,
+        store,
+        args,
+        num_rels,
+        num_nodes,
+    )
+    src_node_features, candidate_node_features = flattened_candidate_features_numpy(
+        batch[:, 0],
+        candidates,
+        current_t,
+        store,
+        args,
+    )
+    weights = None
+    if args.curriculum_decay > 0.0:
+        age = max(0.0, float(dataset_end_t) - float(t_norm))
+        if not args.curriculum_raw_age:
+            age = age / max(float(time_span), 1.0)
+        weights = np.full(
+            len(batch),
+            math.exp(-args.curriculum_decay * age),
+            dtype=np.float32,
+        )
+    return {
+        "events": np.ascontiguousarray(batch.astype(np.int64, copy=False)),
+        "candidates": np.ascontiguousarray(candidates.astype(np.int64, copy=False)),
+        "src_inputs": src_inputs,
+        "dst_inputs": dst_inputs,
+        "query_rel": np.ascontiguousarray(batch[:, 1].astype(np.int64, copy=False)),
+        "src_node_features": src_node_features,
+        "candidate_node_features": candidate_node_features,
+        "weights": weights,
+    }
+
+
+def concat_optional_arrays(items):
+    if not items or items[0] is None:
+        return None
+    return np.concatenate(items, axis=0)
+
+
+def concat_train_chunks(chunks):
+    if not chunks:
+        return None
+    return {
+        "events": np.concatenate([x["events"] for x in chunks], axis=0),
+        "candidates": np.concatenate([x["candidates"] for x in chunks], axis=0),
+        "src_inputs": concat_history_inputs([x["src_inputs"] for x in chunks]),
+        "dst_inputs": concat_history_inputs([x["dst_inputs"] for x in chunks]),
+        "query_rel": np.concatenate([x["query_rel"] for x in chunks], axis=0),
+        "src_node_features": concat_optional_arrays([x["src_node_features"] for x in chunks]),
+        "candidate_node_features": concat_optional_arrays([x["candidate_node_features"] for x in chunks]),
+        "weights": concat_optional_arrays([x["weights"] for x in chunks]),
+    }
+
+
+def autocast_context(args, device):
+    enabled = (
+        bool(getattr(args, "use_amp", False))
+        and getattr(device, "type", None) == "cuda"
+        and torch.cuda.is_available()
+    )
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def make_grad_scaler(args, device):
+    enabled = (
+        bool(getattr(args, "use_amp", False))
+        and getattr(device, "type", None) == "cuda"
+        and torch.cuda.is_available()
+    )
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def train_materialized_batch(
+    model,
+    optimizer,
+    scaler,
+    materialized,
+    args,
+    device,
+    profile,
+):
+    events = materialized["events"]
+    candidates = materialized["candidates"]
+    num_candidates = candidates.shape[1]
+    src_inputs = history_inputs_to_tensors(materialized["src_inputs"], device)
+    dst_inputs = history_inputs_to_tensors(materialized["dst_inputs"], device)
+    query_rel = torch.from_numpy(materialized["query_rel"]).to(device)
+    src_node_features = (
+        None
+        if materialized["src_node_features"] is None
+        else torch.from_numpy(materialized["src_node_features"]).to(device)
+    )
+    candidate_node_features = (
+        None
+        if materialized["candidate_node_features"] is None
+        else torch.from_numpy(materialized["candidate_node_features"]).to(device)
+    )
+
+    t_part = profile_now(args, device)
+    optimizer.zero_grad(set_to_none=True)
+    with autocast_context(args, device):
+        scores = model.score_candidates(
+            src_inputs,
+            dst_inputs,
+            query_rel,
+            num_candidates,
+            source_nodes=events[:, 0],
+            candidate_nodes=candidates,
+            source_node_features=src_node_features,
+            candidate_node_features=candidate_node_features,
+        )
+    profile_add(profile, "train_score_forward_time", profile_now(args, device) - t_part)
+
+    t_part = profile_now(args, device)
+    with autocast_context(args, device):
+        if args.train_loss == "margin":
+            pos_scores = scores[:, 0]
+            hardest_neg_scores = scores[:, 1:].max(dim=1).values
+            target = torch.ones_like(pos_scores)
+            loss_each = F.margin_ranking_loss(
+                pos_scores,
+                hardest_neg_scores,
+                target,
+                margin=args.rank_margin,
+                reduction="none",
+            )
+        else:
+            labels = torch.zeros(len(events), dtype=torch.long, device=device)
+            loss_each = F.cross_entropy(
+                scores / args.temperature,
+                labels,
+                reduction="none",
+            )
+        if materialized["weights"] is not None:
+            weights = torch.from_numpy(materialized["weights"]).to(device)
+            loss = (loss_each * weights).mean()
+        else:
+            loss = loss_each.mean()
+    profile_add(profile, "train_loss_time", profile_now(args, device) - t_part)
+
+    t_part = profile_now(args, device)
+    scaler.scale(loss).backward()
+    if args.grad_clip > 0.0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+    scaler.step(optimizer)
+    scaler.update()
+    profile_add(profile, "train_backward_step_time", profile_now(args, device) - t_part)
+    return float(loss.item()) * len(events), len(events)
+
+
 def source_cache_signature(args):
     keys = [
         "dataset",
@@ -1844,6 +2045,10 @@ def source_cache_signature(args):
         "use_node_geo",
         "thg_time_days",
         "user_center_half_life_days",
+        "stream_train_batch_events",
+        "stream_eval_batch_events",
+        "use_amp",
+        "allow_tf32",
         "use_cross_history",
         "cross_heads",
         "event_encoder",
@@ -2470,6 +2675,7 @@ def train_one_epoch(
     total_count = 0
     profile = {
         "train_batches": 0.0,
+        "train_optimizer_batches": 0.0,
         "train_events": 0.0,
         "train_candidate_scores": 0.0,
         "train_snapshots": 0.0,
@@ -2478,6 +2684,32 @@ def train_one_epoch(
     t0 = time.time()
     train_sampler = getattr(args, "train_sampler", "grouped_exact")
     uses_timestamp_positive_index = train_sampler in {"exact", "grouped_exact"}
+    stream_batch_events = int(getattr(args, "stream_train_batch_events", 0))
+    scaler = make_grad_scaler(args, device)
+    pending_chunks = []
+    pending_events = 0
+
+    def flush_pending():
+        nonlocal pending_chunks, pending_events, total_loss, total_count
+        if not pending_chunks:
+            return
+        t_part = profile_now(args, device)
+        materialized = concat_train_chunks(pending_chunks)
+        profile_add(profile, "train_concat_time", profile_now(args, device) - t_part)
+        loss_sum, count = train_materialized_batch(
+            model,
+            optimizer,
+            scaler,
+            materialized,
+            args,
+            device,
+            profile,
+        )
+        profile_add(profile, "train_optimizer_batches", 1)
+        total_loss += loss_sum
+        total_count += count
+        pending_chunks = []
+        pending_events = 0
 
     for events, t_norm, t_orig in tqdm(train_list, desc="train", leave=False):
         events = events.astype(np.int64, copy=False)
@@ -2534,61 +2766,29 @@ def train_one_epoch(
             profile_add(profile, "train_candidate_build_time", profile_now(args, device) - t_part)
             profile_add(profile, "train_candidate_scores", candidates.size)
             t_part = profile_now(args, device)
-            scores = score_candidate_nodes(
-                model,
+            pending_chunks.append(materialize_train_batch(
                 batch,
                 candidates,
                 current_t,
+                t_norm,
                 store,
                 args,
-                device,
                 num_rels,
                 num_nodes,
-            )
-            profile_add(profile, "train_score_forward_time", profile_now(args, device) - t_part)
-            t_part = profile_now(args, device)
-            if args.train_loss == "margin":
-                pos_scores = scores[:, 0]
-                hardest_neg_scores = scores[:, 1:].max(dim=1).values
-                target = torch.ones_like(pos_scores)
-                loss_each = F.margin_ranking_loss(
-                    pos_scores,
-                    hardest_neg_scores,
-                    target,
-                    margin=args.rank_margin,
-                    reduction="none",
-                )
-            else:
-                labels = torch.zeros(len(batch), dtype=torch.long, device=device)
-                loss_each = F.cross_entropy(
-                    scores / args.temperature, labels, reduction="none"
-                )
-            if args.curriculum_decay > 0.0:
-                age = max(0.0, float(dataset_end_t) - float(t_norm))
-                if not args.curriculum_raw_age:
-                    age = age / max(float(time_span), 1.0)
-                weight = math.exp(-args.curriculum_decay * age)
-                loss = (loss_each * weight).mean()
-            else:
-                loss = loss_each.mean()
-            profile_add(profile, "train_loss_time", profile_now(args, device) - t_part)
-
-            t_part = profile_now(args, device)
-            optimizer.zero_grad()
-            loss.backward()
-            if args.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            profile_add(profile, "train_backward_step_time", profile_now(args, device) - t_part)
-
-            total_loss += float(loss.item()) * len(batch)
-            total_count += len(batch)
+                dataset_end_t,
+                time_span,
+            ))
+            profile_add(profile, "train_materialize_time", profile_now(args, device) - t_part)
+            pending_events += len(batch)
+            if stream_batch_events <= 0 or pending_events >= stream_batch_events:
+                flush_pending()
 
         t_part = profile_now(args, device)
         rel_history.update(events)
         store.update(events, current_t, get_abs_time_value(args, t_norm, t_orig))
         profile_add(profile, "train_store_update_time", profile_now(args, device) - t_part)
 
+    flush_pending()
     sync_device(device)
     train_time = time.time() - t0
     profile["train_total_time"] = train_time
@@ -2809,6 +3009,174 @@ def predict_eval_batch(
     return pos_scores.detach().cpu().numpy().astype(np.float32), neg_scores
 
 
+def materialize_eval_batch(batch_data, neg_arr, neg_mask, current_t, store, args, num_rels, num_nodes):
+    batch_data = np.ascontiguousarray(batch_data.astype(np.int64, copy=False))
+    neg_arr = np.ascontiguousarray(neg_arr.astype(np.int64, copy=False))
+    neg_mask = np.ascontiguousarray(neg_mask.astype(bool, copy=False))
+    neg_safe = neg_arr.copy() if np.any(neg_arr < 0) else neg_arr
+    if np.any(neg_safe < 0):
+        neg_safe[neg_safe < 0] = 0
+    pos_candidates = np.ascontiguousarray(batch_data[:, 2:3])
+    src_inputs = histories_to_numpy(batch_data[:, 0], current_t, store, args, num_rels, num_nodes)
+    pos_dst_inputs = histories_to_numpy(
+        pos_candidates.reshape(-1),
+        current_t,
+        store,
+        args,
+        num_rels,
+        num_nodes,
+    )
+    neg_dst_inputs = histories_to_numpy(
+        neg_safe.reshape(-1),
+        current_t,
+        store,
+        args,
+        num_rels,
+        num_nodes,
+    )
+    pos_src_features, pos_candidate_features = flattened_candidate_features_numpy(
+        batch_data[:, 0],
+        pos_candidates,
+        current_t,
+        store,
+        args,
+    )
+    neg_src_features, neg_candidate_features = flattened_candidate_features_numpy(
+        batch_data[:, 0],
+        neg_safe,
+        current_t,
+        store,
+        args,
+    )
+    return {
+        "batch_data": batch_data,
+        "neg_arr": neg_safe,
+        "neg_mask": neg_mask,
+        "src_inputs": src_inputs,
+        "pos_dst_inputs": pos_dst_inputs,
+        "neg_dst_inputs": neg_dst_inputs,
+        "pos_src_features": pos_src_features,
+        "pos_candidate_features": pos_candidate_features,
+        "neg_src_features": neg_src_features,
+        "neg_candidate_features": neg_candidate_features,
+    }
+
+
+def concat_eval_chunks(chunks):
+    if not chunks:
+        return None
+    widths = {x["neg_arr"].shape[1] for x in chunks}
+    if len(widths) != 1:
+        raise ValueError(f"stream eval requires equal negative widths within a flush, got {sorted(widths)}")
+    return {
+        "batch_data": np.concatenate([x["batch_data"] for x in chunks], axis=0),
+        "neg_arr": np.concatenate([x["neg_arr"] for x in chunks], axis=0),
+        "neg_mask": np.concatenate([x["neg_mask"] for x in chunks], axis=0),
+        "src_inputs": concat_history_inputs([x["src_inputs"] for x in chunks]),
+        "pos_dst_inputs": concat_history_inputs([x["pos_dst_inputs"] for x in chunks]),
+        "neg_dst_inputs": concat_history_inputs([x["neg_dst_inputs"] for x in chunks]),
+        "pos_src_features": concat_optional_arrays([x["pos_src_features"] for x in chunks]),
+        "pos_candidate_features": concat_optional_arrays([x["pos_candidate_features"] for x in chunks]),
+        "neg_src_features": concat_optional_arrays([x["neg_src_features"] for x in chunks]),
+        "neg_candidate_features": concat_optional_arrays([x["neg_candidate_features"] for x in chunks]),
+    }
+
+
+def score_materialized_eval_batch(model, materialized, args, device, profile=None):
+    batch_data = materialized["batch_data"]
+    neg_arr = materialized["neg_arr"]
+    batch_size, max_negs = neg_arr.shape
+    query_rel = torch.from_numpy(batch_data[:, 1].astype(np.int64, copy=False)).to(device)
+    src_inputs = history_inputs_to_tensors(materialized["src_inputs"], device)
+    pos_dst_inputs = history_inputs_to_tensors(materialized["pos_dst_inputs"], device)
+    pos_src_features = (
+        None
+        if materialized["pos_src_features"] is None
+        else torch.from_numpy(materialized["pos_src_features"]).to(device)
+    )
+    pos_candidate_features = (
+        None
+        if materialized["pos_candidate_features"] is None
+        else torch.from_numpy(materialized["pos_candidate_features"]).to(device)
+    )
+
+    t_part = forward_tic(profile, args, device)
+    with autocast_context(args, device):
+        source_encoded = model.encode_source(src_inputs, query_rel)
+        pos_scores_t = model.score_candidates_from_source(
+            source_encoded,
+            pos_dst_inputs,
+            query_rel,
+            1,
+            source_nodes=batch_data[:, 0],
+            candidate_nodes=batch_data[:, 2:3],
+            source_node_features=pos_src_features,
+            candidate_node_features=pos_candidate_features,
+        ).reshape(-1, 1)
+    forward_toc(profile, args, device, t_part, "eval_pos_score_time")
+
+    pos_scores = pos_scores_t.detach().cpu().numpy().astype(np.float32)
+    neg_scores = np.zeros((batch_size, max_negs), dtype=np.float32)
+    start = 0
+    chunk_size = int(args.eval_neg_chunk)
+    max_eval_pairs = int(getattr(args, "max_eval_pairs", 0))
+    if max_eval_pairs > 0 and batch_size > 0:
+        chunk_size = min(chunk_size, max(1, max_eval_pairs // int(batch_size)))
+    row_offsets = np.arange(batch_size, dtype=np.int64).reshape(-1, 1) * int(max_negs)
+    while start < max_negs:
+        end = min(start + chunk_size, max_negs)
+        try:
+            profile_add(profile, "eval_neg_chunks", 1)
+            profile_add(profile, "eval_neg_candidates", batch_size * (end - start))
+            cols = np.arange(start, end, dtype=np.int64).reshape(1, -1)
+            flat_rows = (row_offsets + cols).reshape(-1)
+            neg_dst_inputs = history_inputs_to_tensors(
+                take_history_rows(materialized["neg_dst_inputs"], flat_rows),
+                device,
+            )
+            neg_candidate_features = (
+                None
+                if materialized["neg_candidate_features"] is None
+                else torch.from_numpy(
+                    np.ascontiguousarray(materialized["neg_candidate_features"][flat_rows])
+                ).to(device)
+            )
+            neg_src_features = (
+                None
+                if materialized["neg_src_features"] is None
+                else torch.from_numpy(materialized["neg_src_features"]).to(device)
+            )
+            neg_chunk = np.ascontiguousarray(neg_arr[:, start:end])
+            t_part = forward_tic(profile, args, device)
+            with autocast_context(args, device):
+                scores = model.score_candidates_from_source(
+                    source_encoded,
+                    neg_dst_inputs,
+                    query_rel,
+                    end - start,
+                    source_nodes=batch_data[:, 0],
+                    candidate_nodes=neg_chunk,
+                    source_node_features=neg_src_features,
+                    candidate_node_features=neg_candidate_features,
+                )
+            forward_toc(profile, args, device, t_part, "eval_neg_score_time")
+            neg_scores[:, start:end] = scores.detach().cpu().numpy().astype(np.float32)
+            del scores, neg_dst_inputs
+            start = end
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower() or chunk_size <= 1:
+                raise
+            profile_add(profile, "eval_oom_retries", 1)
+            chunk_size = max(1, chunk_size // 2)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print(
+                f"[TimeTKG] CUDA OOM during stream eval; retrying with eval_neg_chunk={chunk_size}",
+                flush=True,
+            )
+    return pos_scores, neg_scores
+
+
 def validate_eval_neg_batch(args, mode, batch_data, neg_mask):
     q = int(getattr(args, "ns_q", -1))
     if q <= 0 or len(batch_data) == 0:
@@ -2864,6 +3232,40 @@ def evaluate_split(
     first_batch_logged = False
     max_events = None if max_events is None or int(max_events) <= 0 else int(max_events)
     stop_eval = False
+    stream_eval_batch_events = int(getattr(args, "stream_eval_batch_events", 0))
+    if stream_eval_batch_events > 0:
+        source_cache.path = None
+        source_cache.values.clear()
+    pending_eval_chunks = []
+    pending_eval_events = 0
+
+    def flush_eval_pending():
+        nonlocal pending_eval_chunks, pending_eval_events, metric_count, stop_eval
+        if not pending_eval_chunks:
+            return
+        t_part = profile_now(args, device)
+        materialized = concat_eval_chunks(pending_eval_chunks)
+        profile_add(profile, "eval_concat_time", profile_now(args, device) - t_part)
+        pos, neg = score_materialized_eval_batch(
+            model,
+            materialized,
+            args,
+            device,
+            profile=profile,
+        )
+        t_part = profile_now(args, device)
+        batch_metrics = compute_ranking_metric_sums(pos, neg, materialized["neg_mask"])
+        profile_add(profile, "eval_metric_time", profile_now(args, device) - t_part)
+        add_metric_sums(metric_sums, batch_metrics)
+        metric_count += int(batch_metrics["count"])
+        if writer is not None:
+            t_part = profile_now(args, device)
+            writer.write_batch(pos, neg, materialized["neg_mask"])
+            profile_add(profile, "eval_writer_time", profile_now(args, device) - t_part)
+        pending_eval_chunks = []
+        pending_eval_events = 0
+        if max_events is not None and metric_count >= max_events:
+            stop_eval = True
 
     for events, t_norm, t_orig in tqdm(snapshot_list, desc=mode, leave=False):
         current_t = get_model_time_value(args, t_norm, t_orig)
@@ -2878,21 +3280,24 @@ def evaluate_split(
             if can_cache_eval_nodes(model)
             else None
         )
-        preload_snapshot_eval_nodes(
-            model,
-            events,
-            current_t,
-            t_orig,
-            mode,
-            neg_sampler,
-            store,
-            args,
-            device,
-            num_rels,
-            num_nodes,
-            node_cache,
-            profile=profile,
-        )
+        if stream_eval_batch_events <= 0:
+            preload_snapshot_eval_nodes(
+                model,
+                events,
+                current_t,
+                t_orig,
+                mode,
+                neg_sampler,
+                store,
+                args,
+                device,
+                num_rels,
+                num_nodes,
+                node_cache,
+                profile=profile,
+            )
+        else:
+            node_cache = None
         batch_iter = collect_eval_batch(events, t_orig, neg_sampler, mode, args.eval_batch_size)
         while True:
             t_part = profile_now(args, device)
@@ -2911,32 +3316,53 @@ def evaluate_split(
                     flush=True,
                 )
                 first_batch_logged = True
-            pos, neg = predict_eval_batch(
-                model,
-                batch_data,
-                neg_arr,
-                current_t,
-                store,
-                args,
-                device,
-                num_rels,
-                num_nodes,
-                source_cache=source_cache,
-                node_cache=node_cache,
-                profile=profile,
-            )
-            t_part = profile_now(args, device)
-            batch_metrics = compute_ranking_metric_sums(pos, neg, neg_mask)
-            profile_add(profile, "eval_metric_time", profile_now(args, device) - t_part)
-            add_metric_sums(metric_sums, batch_metrics)
-            metric_count += int(batch_metrics["count"])
-            if writer is not None:
+            if stream_eval_batch_events > 0:
+                profile_add(profile, "eval_batches", 1)
+                profile_add(profile, "eval_events", len(batch_data))
                 t_part = profile_now(args, device)
-                writer.write_batch(pos, neg, neg_mask)
-                profile_add(profile, "eval_writer_time", profile_now(args, device) - t_part)
-            if max_events is not None and metric_count >= max_events:
-                stop_eval = True
-                break
+                pending_eval_chunks.append(materialize_eval_batch(
+                    batch_data,
+                    neg_arr,
+                    neg_mask,
+                    current_t,
+                    store,
+                    args,
+                    num_rels,
+                    num_nodes,
+                ))
+                profile_add(profile, "eval_materialize_time", profile_now(args, device) - t_part)
+                pending_eval_events += len(batch_data)
+                if pending_eval_events >= stream_eval_batch_events:
+                    flush_eval_pending()
+                    if stop_eval:
+                        break
+            else:
+                pos, neg = predict_eval_batch(
+                    model,
+                    batch_data,
+                    neg_arr,
+                    current_t,
+                    store,
+                    args,
+                    device,
+                    num_rels,
+                    num_nodes,
+                    source_cache=source_cache,
+                    node_cache=node_cache,
+                    profile=profile,
+                )
+                t_part = profile_now(args, device)
+                batch_metrics = compute_ranking_metric_sums(pos, neg, neg_mask)
+                profile_add(profile, "eval_metric_time", profile_now(args, device) - t_part)
+                add_metric_sums(metric_sums, batch_metrics)
+                metric_count += int(batch_metrics["count"])
+                if writer is not None:
+                    t_part = profile_now(args, device)
+                    writer.write_batch(pos, neg, neg_mask)
+                    profile_add(profile, "eval_writer_time", profile_now(args, device) - t_part)
+                if max_events is not None and metric_count >= max_events:
+                    stop_eval = True
+                    break
 
         if stop_eval:
             break
@@ -2952,6 +3378,7 @@ def evaluate_split(
         if node_cache is not None:
             node_cache.clear()
 
+    flush_eval_pending()
     if writer is not None:
         writer.close()
     source_cache.close()
@@ -3294,6 +3721,10 @@ def get_run_params(args):
         "thgdays": int(getattr(args, "thg_time_days", False)),
         "geo": int(getattr(args, "use_node_geo", False)),
         "uchl": getattr(args, "user_center_half_life_days", 0.0),
+        "stb": getattr(args, "stream_train_batch_events", 0),
+        "seb": getattr(args, "stream_eval_batch_events", 0),
+        "amp": int(getattr(args, "use_amp", False)),
+        "tf32": int(getattr(args, "allow_tf32", False)),
         "cross": int(getattr(args, "use_cross_history", False)),
         "xh": (
             getattr(args, "cross_heads", 2)
@@ -3397,6 +3828,7 @@ def print_epoch_profile(epoch, args, model, train_profile, val_profile, device, 
         f"backward={format_seconds(profile_get(train_profile, 'train_backward_step_time'))} "
         f"update={format_seconds(profile_get(train_profile, 'train_store_update_time'))} "
         f"batches={int(profile_get(train_profile, 'train_batches'))} "
+        f"opt_batches={int(profile_get(train_profile, 'train_optimizer_batches'))} "
         f"events={int(profile_get(train_profile, 'train_events'))} "
         f"cands={int(profile_get(train_profile, 'train_candidate_scores'))}",
         flush=True,
@@ -3444,6 +3876,10 @@ def print_epoch_profile(epoch, args, model, train_profile, val_profile, device, 
         f"neighbor={int(getattr(args, 'use_neighbor_id', False))} "
         f"mw={getattr(args, 'multi_windows', '') or 'off'} "
         f"encoder={getattr(args, 'event_encoder', 'mixer')} "
+        f"stream_train={int(getattr(args, 'stream_train_batch_events', 0))} "
+        f"stream_eval={int(getattr(args, 'stream_eval_batch_events', 0))} "
+        f"amp={int(getattr(args, 'use_amp', False))} "
+        f"tf32={int(getattr(args, 'allow_tf32', False))} "
         f"profile_sync={int(getattr(args, 'profile_sync', False))}",
         flush=True,
     )
@@ -3458,6 +3894,14 @@ def validate_args(args):
         args.thg_time_days = False
     if not hasattr(args, "user_center_half_life_days"):
         args.user_center_half_life_days = 365.0
+    if not hasattr(args, "stream_train_batch_events"):
+        args.stream_train_batch_events = 0
+    if not hasattr(args, "stream_eval_batch_events"):
+        args.stream_eval_batch_events = 0
+    if not hasattr(args, "use_amp"):
+        args.use_amp = False
+    if not hasattr(args, "allow_tf32"):
+        args.allow_tf32 = False
     if args.ns_q == 0 or args.ns_q < -1:
         raise ValueError("--ns_q must be -1 or a positive integer")
     if not 0.0 <= float(args.train_predict_ratio) < 1.0:
@@ -3497,6 +3941,10 @@ def validate_args(args):
         raise ValueError("--rank_margin must be positive when --train_loss=margin")
     if float(getattr(args, "user_center_half_life_days", 365.0)) < 0.0:
         raise ValueError("--user_center_half_life_days must be non-negative")
+    if int(getattr(args, "stream_train_batch_events", 0)) < 0:
+        raise ValueError("--stream_train_batch_events must be non-negative")
+    if int(getattr(args, "stream_eval_batch_events", 0)) < 0:
+        raise ValueError("--stream_eval_batch_events must be non-negative")
     if args.num_epochs <= 0:
         raise ValueError("--num_epochs must be positive")
     if args.patience <= 0:
@@ -3508,6 +3956,9 @@ def validate_args(args):
 
 def main(args):
     validate_args(args)
+    if getattr(args, "allow_tf32", False) and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     set_random_seed(args.seed)
     device = torch.device(
         f"cuda:{args.gpu}" if torch.cuda.is_available() and args.gpu >= 0 else "cpu"

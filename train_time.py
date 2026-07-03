@@ -16,28 +16,6 @@ THG_DATASETS = {
 }
 
 
-def add_bool_arg(parser, name, default=False, help_text=""):
-    flag = name.replace("_", "-")
-    opts = [f"--{name}"]
-    if flag != name:
-        opts.append(f"--{flag}")
-    parser.add_argument(*opts, dest=name, action="store_true", help=help_text)
-    no_opts = [f"--no_{name}", f"--no-{flag}"]
-    parser.add_argument(*no_opts, dest=name, action="store_false")
-    parser.set_defaults(**{name: default})
-
-
-def add_auto_bool_arg(parser, name, help_text=""):
-    flag = name.replace("_", "-")
-    opts = [f"--{name}"]
-    if flag != name:
-        opts.append(f"--{flag}")
-    parser.add_argument(*opts, dest=name, action="store_true", help=help_text)
-    no_opts = [f"--no_{name}", f"--no-{flag}"]
-    parser.add_argument(*no_opts, dest=name, action="store_false")
-    parser.set_defaults(**{name: None})
-
-
 def normalize_args(args):
     is_thg = args.dataset in THG_DATASETS
     if args.use_node_geo is None:
@@ -69,18 +47,22 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--output_dir", default="")
-    add_bool_arg(parser, "force", default=False)
+    parser.add_argument("--force", action="store_true", default=False)
 
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--eval_batch_size", type=int, default=256)
     parser.add_argument("--eval_neg_chunk", type=int, default=512)
     parser.add_argument("--max_eval_pairs", type=int, default=500000)
+    parser.add_argument("--stream_eval_batch_events", type=int, default=128)
     parser.add_argument("--eval_node_preload_chunk", type=int, default=65536)
     parser.add_argument("--max_eval_node_cache_mb", type=float, default=4096.0)
-    add_bool_arg(parser, "preload_eval_nodes", default=True)
-    add_bool_arg(parser, "dense_eval_node_cache", default=True)
-    add_bool_arg(parser, "cache_eval_source", default=False)
-    add_bool_arg(parser, "eval_test", default=True)
+    parser.set_defaults(preload_eval_nodes=True)
+    parser.add_argument("--no_preload_eval_nodes", dest="preload_eval_nodes", action="store_false")
+    parser.set_defaults(dense_eval_node_cache=True)
+    parser.add_argument("--no_dense_eval_node_cache", dest="dense_eval_node_cache", action="store_false")
+    parser.add_argument("--cache_eval_source", action="store_true", default=False)
+    parser.set_defaults(eval_test=True)
+    parser.add_argument("--no_eval_test", dest="eval_test", action="store_false")
 
     parser.add_argument("--ns_q", type=int, default=1000)
     parser.add_argument("--ns_seed", type=int, default=42)
@@ -94,6 +76,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--weight_decay", type=float, default=5e-5)
     parser.add_argument("--train_num_neg", type=int, default=8)
+    parser.add_argument("--stream_train_batch_events", type=int, default=8192)
     parser.add_argument("--hard_neg_ratio", type=float, default=0.5)
     parser.add_argument(
         "--train_sampler",
@@ -107,7 +90,7 @@ def parse_args():
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--tolerance", type=float, default=1e-8)
     parser.add_argument("--curriculum_decay", type=float, default=0.0)
-    add_bool_arg(parser, "curriculum_raw_age", default=False)
+    parser.add_argument("--curriculum_raw_age", action="store_true", default=False)
 
     parser.add_argument("--topk", type=int, default=40)
     parser.add_argument("--multi_windows", default="10,40")
@@ -121,33 +104,31 @@ def parse_args():
     parser.add_argument("--time_min", type=float, default=1.0)
     parser.add_argument("--token_expansion_factor", type=float, default=0.5)
     parser.add_argument("--channel_expansion_factor", type=float, default=4.0)
-    add_bool_arg(parser, "use_single_layer", default=False)
+    parser.add_argument("--use_single_layer", action="store_true", default=False)
     parser.add_argument("--predictor_mode", choices=("diag", "concat"), default="diag")
     parser.add_argument("--event_encoder", choices=("mixer", "transformer"), default="mixer")
     parser.add_argument("--transformer_heads", type=int, default=2)
     parser.add_argument("--transformer_ff_dim", type=int, default=None)
-    add_bool_arg(parser, "use_cross_history", default=False)
+    parser.add_argument("--use_cross_history", action="store_true", default=False)
     parser.add_argument("--cross_heads", type=int, default=2)
 
-    add_bool_arg(parser, "use_neighbor_id", default=True)
-    add_bool_arg(parser, "use_abs_time", default=True)
+    parser.set_defaults(use_neighbor_id=True)
+    parser.add_argument("--no_use_neighbor_id", dest="use_neighbor_id", action="store_false")
+    parser.set_defaults(use_abs_time=True)
+    parser.add_argument("--no_use_abs_time", dest="use_abs_time", action="store_false")
     parser.add_argument("--abs_time_periods", default="7,30,180,365")
     parser.add_argument("--abs_time_harmonics", type=int, default=1)
-    add_bool_arg(parser, "abs_time_use_raw", default=False)
-    add_bool_arg(parser, "use_query_gate", default=True)
+    parser.add_argument("--abs_time_use_raw", action="store_true", default=False)
+    parser.set_defaults(use_query_gate=True)
+    parser.add_argument("--no_use_query_gate", dest="use_query_gate", action="store_false")
     parser.add_argument("--query_gate_type", choices=("channel", "scalar"), default="channel")
-    add_bool_arg(parser, "use_rank_pos", default=True)
+    parser.set_defaults(use_rank_pos=True)
+    parser.add_argument("--no_use_rank_pos", dest="use_rank_pos", action="store_false")
 
-    add_auto_bool_arg(
-        parser,
-        "use_node_geo",
-        help_text="Use Yelp/THG node geo features. Default: on for Yelp datasets, off otherwise.",
-    )
-    add_auto_bool_arg(
-        parser,
-        "thg_time_days",
-        help_text="Use raw timestamp days as model time. Default: on for Yelp datasets, off otherwise.",
-    )
+    parser.add_argument("--use_node_geo", dest="use_node_geo", action="store_true", default=None)
+    parser.add_argument("--no_use_node_geo", dest="use_node_geo", action="store_false")
+    parser.add_argument("--thg_time_days", dest="thg_time_days", action="store_true", default=None)
+    parser.add_argument("--no_thg_time_days", dest="thg_time_days", action="store_false")
     parser.add_argument("--user_center_half_life_days", type=float, default=365.0)
 
     parser.add_argument(
@@ -156,8 +137,13 @@ def parse_args():
         action="store_true",
         default=False,
     )
-    add_bool_arg(parser, "reuse_no_retrain_full", default=True)
-    add_bool_arg(parser, "profile_sync", default=False)
+    parser.set_defaults(reuse_no_retrain_full=True)
+    parser.add_argument("--no_reuse_no_retrain_full", dest="reuse_no_retrain_full", action="store_false")
+    parser.add_argument("--profile_sync", action="store_true", default=False)
+    parser.set_defaults(use_amp=True)
+    parser.add_argument("--no_use_amp", dest="use_amp", action="store_false")
+    parser.set_defaults(allow_tf32=True)
+    parser.add_argument("--no_allow_tf32", dest="allow_tf32", action="store_false")
     return normalize_args(parser.parse_args())
 
 
