@@ -51,9 +51,9 @@ def parse_args():
 
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--eval_batch_size", type=int, default=256)
-    parser.add_argument("--eval_neg_chunk", type=int, default=512)
-    parser.add_argument("--max_eval_pairs", type=int, default=500000)
-    parser.add_argument("--stream_eval_batch_events", type=int, default=128)
+    parser.add_argument("--eval_neg_chunk", type=int, default=128)
+    parser.add_argument("--max_eval_pairs", type=int, default=125000)
+    parser.add_argument("--stream_eval_batch_events", type=int, default=32)
     parser.add_argument("--eval_node_preload_chunk", type=int, default=65536)
     parser.add_argument("--max_eval_node_cache_mb", type=float, default=4096.0)
     parser.set_defaults(preload_eval_nodes=True)
@@ -76,7 +76,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--weight_decay", type=float, default=5e-5)
     parser.add_argument("--train_num_neg", type=int, default=8)
-    parser.add_argument("--stream_train_batch_events", type=int, default=8192)
+    parser.add_argument("--stream_train_batch_events", type=int, default=2048)
     parser.add_argument("--hard_neg_ratio", type=float, default=0.5)
     parser.add_argument(
         "--train_sampler",

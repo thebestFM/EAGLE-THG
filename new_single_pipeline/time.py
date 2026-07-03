@@ -1,12 +1,3 @@
-"""Time-module score generation for the new structure/time hybrid pipeline.
-
-This module is intentionally self-contained for ``train_time.py``.  It keeps the
-behavior of the previous time implementation that the hybrid score stores depend
-on: train with an online recent-event store, select the best epoch on validation,
-write train-suffix/validation/test score stores, and optionally skip the OOF
-prefix retraining step for faster upper-bound experiments.
-"""
-
 import hashlib
 import json
 import math
@@ -20,7 +11,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm import tqdm
 
 from utils import (
     ScoreWriter,
@@ -86,6 +76,40 @@ def profile_now(args=None, device=None):
     if args is not None and device is not None:
         profile_sync_if_needed(args, device)
     return time.time()
+
+
+def make_progress_printer(label, total):
+    total = int(total)
+    if total <= 0:
+        return lambda *args, **kwargs: None
+    milestones = {
+        max(1, int(math.ceil(total * frac / 10.0)))
+        for frac in range(1, 11)
+    }
+    printed = set()
+    t0 = time.time()
+
+    def printer(idx, t_norm=None, t_orig=None, events=None, extra=""):
+        idx = int(idx)
+        if idx not in milestones or idx in printed:
+            return
+        printed.add(idx)
+        pct = 100.0 * idx / max(total, 1)
+        parts = [
+            f"[TimeTKG][{label}] progress {idx}/{total} ({pct:.0f}%)",
+        ]
+        if t_norm is not None:
+            parts.append(f"t_norm={int(t_norm)}")
+        if t_orig is not None:
+            parts.append(f"t_orig={int(t_orig)}")
+        if events is not None:
+            parts.append(f"events={int(events)}")
+        if extra:
+            parts.append(str(extra))
+        parts.append(f"elapsed={time.time() - t0:.1f}s")
+        print(" ".join(parts), flush=True)
+
+    return printer
 
 
 def forward_tic(profile, args, device):
@@ -2711,7 +2735,8 @@ def train_one_epoch(
         pending_chunks = []
         pending_events = 0
 
-    for events, t_norm, t_orig in tqdm(train_list, desc="train", leave=False):
+    progress = make_progress_printer("train", len(train_list))
+    for snapshot_idx, (events, t_norm, t_orig) in enumerate(train_list, start=1):
         events = events.astype(np.int64, copy=False)
         current_t = get_model_time_value(args, t_norm, t_orig)
         profile_add(profile, "train_snapshots", 1)
@@ -2787,6 +2812,13 @@ def train_one_epoch(
         rel_history.update(events)
         store.update(events, current_t, get_abs_time_value(args, t_norm, t_orig))
         profile_add(profile, "train_store_update_time", profile_now(args, device) - t_part)
+        progress(
+            snapshot_idx,
+            t_norm=t_norm,
+            t_orig=t_orig,
+            events=len(events),
+            extra=f"opt_batches={int(profile.get('train_optimizer_batches', 0))}",
+        )
 
     flush_pending()
     sync_device(device)
@@ -3267,7 +3299,8 @@ def evaluate_split(
         if max_events is not None and metric_count >= max_events:
             stop_eval = True
 
-    for events, t_norm, t_orig in tqdm(snapshot_list, desc=mode, leave=False):
+    progress = make_progress_printer(mode, len(snapshot_list))
+    for snapshot_idx, (events, t_norm, t_orig) in enumerate(snapshot_list, start=1):
         current_t = get_model_time_value(args, t_norm, t_orig)
         profile_add(profile, "eval_snapshots", 1)
         node_cache = (
@@ -3377,6 +3410,13 @@ def evaluate_split(
         source_cache.values.clear()
         if node_cache is not None:
             node_cache.clear()
+        progress(
+            snapshot_idx,
+            t_norm=t_norm,
+            t_orig=t_orig,
+            events=len(events),
+            extra=f"metric_count={metric_count}",
+        )
 
     flush_eval_pending()
     if writer is not None:
@@ -3399,12 +3439,14 @@ def evaluate_split(
 
 def warmup_train_history(train_list, args, num_nodes, data=None):
     store = make_recent_store(args, num_nodes, data=data)
-    for events, t_norm, t_orig in tqdm(train_list, desc="warmup", leave=False):
+    progress = make_progress_printer("warmup", len(train_list))
+    for snapshot_idx, (events, t_norm, t_orig) in enumerate(train_list, start=1):
         store.update(
             events.astype(np.int64, copy=False),
             get_model_time_value(args, t_norm, t_orig),
             get_abs_time_value(args, t_norm, t_orig),
         )
+        progress(snapshot_idx, t_norm=t_norm, t_orig=t_orig, events=len(events))
     return store
 
 
