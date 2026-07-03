@@ -84,7 +84,7 @@ def base_time_args(args):
         "use_node_geo": None,
         "thg_time_days": None,
         "user_center_half_life_days": 365.0,
-        "no_retrain_on_train_prefix": False,
+        "no_retrain_on_train_prefix": not bool(args.with_oof_retrain),
         "reuse_no_retrain_full": True,
         "profile_sync": False,
         "use_amp": True,
@@ -215,6 +215,7 @@ def parse_args():
     parser.add_argument("--sampler_seed", type=int, default=42)
     parser.add_argument("--study_name", default="")
     parser.add_argument("--force", action="store_true", default=False)
+    parser.add_argument("--with_oof_retrain", action="store_true", default=False)
     parser.add_argument("--output_root", default="tuning_records_time")
     return parser.parse_args()
 

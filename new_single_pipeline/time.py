@@ -4084,6 +4084,7 @@ def main(args):
         args,
         required_modes=("val", "test") if getattr(args, "eval_test", True) else ("val",),
     )
+    resumed_from_best_model = False
     if reusable_full is not None:
         print(
             f"[TimeTKG] reusing full-train model and val/test scores from "
@@ -4114,6 +4115,30 @@ def main(args):
             "train_peak_alloc_mb": float(reused_metrics.get("full_train_peak_alloc_mb", reused_metrics.get("train_peak_alloc_mb", 0.0))),
             "train_peak_reserved_mb": float(reused_metrics.get("full_train_peak_reserved_mb", reused_metrics.get("train_peak_reserved_mb", 0.0))),
         }
+    elif osp.isfile(best_path) and not bool(getattr(args, "force", False)):
+        print(
+            f"[TimeTKG] found existing best_model.pt; loading and skipping full training: {best_path}",
+            flush=True,
+        )
+        state = torch.load(best_path, map_location=device)
+        model.load_state_dict(state)
+        resumed_from_best_model = True
+        best_epoch = 0
+        best_val_score = 0.0
+        best_val_metrics = {}
+        full_result = {
+            "model": model,
+            "best_epoch": int(best_epoch),
+            "best_val_score": float(best_val_score),
+            "best_val_metrics": best_val_metrics,
+            "train_time_sec": 0.0,
+            "train_peak_alloc_mb": 0.0,
+            "train_peak_reserved_mb": 0.0,
+        }
+    elif bool(getattr(args, "require_existing_best_model", False)):
+        raise FileNotFoundError(
+            f"--require_existing_best_model was set but no checkpoint was found: {best_path}"
+        )
     else:
         full_result = train_model_phase(
             model,
@@ -4314,6 +4339,7 @@ def main(args):
         "full_train_peak_reserved_mb": float(full_result["train_peak_reserved_mb"]),
         "reused_no_retrain_full": bool(reusable_full is not None),
         "reused_no_retrain_full_dir": reusable_full["dir"] if reusable_full is not None else "",
+        "resumed_from_best_model": bool(resumed_from_best_model),
     }
     if oof_result is not None:
         metrics.update(

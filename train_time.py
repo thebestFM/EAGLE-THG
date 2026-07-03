@@ -137,6 +137,7 @@ def parse_args():
         action="store_true",
         default=False,
     )
+    parser.add_argument("--require_existing_best_model", action="store_true", default=False)
     parser.set_defaults(reuse_no_retrain_full=True)
     parser.add_argument("--no_reuse_no_retrain_full", dest="reuse_no_retrain_full", action="store_false")
     parser.add_argument("--profile_sync", action="store_true", default=False)
