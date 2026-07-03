@@ -1,0 +1,58 @@
+{
+  "city_dir": "New_Orleans_LA",
+  "source_dynamic_edges": 373685,
+  "num_users": 30899,
+  "num_businesses": 5129,
+  "num_entities_user_business_disjoint": 36028,
+  "user_id_range": [
+    0,
+    30898
+  ],
+  "business_id_range": [
+    30899,
+    36027
+  ],
+  "num_relations": 6,
+  "relation2id": {
+    "review_1star": 0,
+    "review_2star": 1,
+    "review_3star": 2,
+    "review_4star": 3,
+    "review_5star": 4,
+    "tip": 5
+  },
+  "t0_original_timestamp": "2005-03-14 18:07:51",
+  "timestamp_unit": "seconds since t0_original_timestamp",
+  "timestamp_min": 0,
+  "timestamp_max": 531797671,
+  "unique_relative_timestamps": 373248,
+  "split_rows": {
+    "train": 261579,
+    "valid": 23556,
+    "test": 16819
+  },
+  "static_user_friend_edges_rows": 278488,
+  "static_user_friend_edges_dropped_missing_users": 0,
+  "business_geo_source": "Yelp business metadata: business_id maps dynamic review/tip events to business_nodes.csv latitude/longitude copied from business.json.",
+  "businesses_missing_geo": 0,
+  "first_event_check": {
+    "raw_user_id": "3zBJUlWtPNoZ0uN83ODbyg",
+    "assigned_user_id": 0,
+    "raw_business_id": "XkQadWW9bUR855KvPZBNUw",
+    "assigned_business_id": 30899,
+    "expected_first_user_id": 0,
+    "expected_first_business_id": 30899,
+    "relative_ts": 0
+  },
+  "output_files": [
+    "train_events.csv",
+    "valid_events.csv",
+    "test_events.csv",
+    "static_user_friend_edges.csv",
+    "user_id_map.csv",
+    "business_id_map.csv",
+    "relation_id_map.csv",
+    "model_input_stats.json",
+    "README.md"
+  ]
+}
