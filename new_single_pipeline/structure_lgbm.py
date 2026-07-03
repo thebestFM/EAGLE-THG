@@ -53,10 +53,36 @@ def split_snapshots(data, split):
 
 
 def events_for_update(events, data, args, is_train=False):
+    if hasattr(tns, "events_for_update"):
+        return tns.events_for_update(events, data, args, is_train=is_train)
     events_f64 = np.ascontiguousarray(events, dtype=np.float64)
     if not is_train and data["is_tgb"] and not bool(getattr(args, "close_update_backward", False)):
         return inverse_aug(events_f64, data["num_rels_raw"], data["num_rels"])
     return events_f64
+
+
+def runtime_num_rels(data):
+    if hasattr(tns, "runtime_num_rels"):
+        return int(tns.runtime_num_rels(data))
+    return int(data["num_rels"])
+
+
+def model_time_value(data, t_norm, t_orig):
+    if hasattr(tns, "structure_time_value"):
+        return float(tns.structure_time_value(data, t_norm, t_orig))
+    return float(t_norm)
+
+
+def estimate_max_model_time(data):
+    if hasattr(tns, "estimate_max_model_time"):
+        return float(tns.estimate_max_model_time(data))
+    if hasattr(tns, "estimate_max_t_norm"):
+        return float(tns.estimate_max_t_norm(data))
+    max_t = 0.0
+    for split_name in ("train_list", "val_list", "test_list"):
+        for _, t_norm, t_orig in data.get(split_name, []):
+            max_t = max(max_t, model_time_value(data, t_norm, t_orig))
+    return float(max_t)
 
 
 def metric_value(metrics, metric):
@@ -230,9 +256,10 @@ class CausalHistory:
 
 class StructureComponentRuntime:
     def __init__(self, data, args, device):
-        max_t_norm = tns.estimate_max_t_norm(data)
+        num_rels = runtime_num_rels(data)
+        max_t_norm = estimate_max_model_time(data)
         self.direct = tns.DirectSingleHopScorer(
-            data["num_rels"],
+            num_rels,
             decay_direct=float(args.decay_direct),
             max_time_span=max_t_norm,
             log_bucket_stats=bool(getattr(args, "dsh_log_bucket_stats", False)),
@@ -240,7 +267,7 @@ class StructureComponentRuntime:
         self.predictor, self.semantic_updater, self.logic_updater = tns.build_runtime(
             args,
             data["num_nodes"],
-            data["num_rels"],
+            num_rels,
             device,
         )
         self.args = args
@@ -276,13 +303,13 @@ class StructureComponentRuntime:
             "structure_raw": (final_pos, final_neg),
         }
 
-    def update(self, events, t_norm):
+    def update(self, events, current_t):
         events_f64 = np.asarray(events, dtype=np.float64)
         tns.update_runtime(
             self.predictor,
             self.direct,
             events_f64,
-            t_norm,
+            current_t,
             self.semantic_updater,
             self.logic_updater,
         )
@@ -344,8 +371,9 @@ def predict_dmh_shared_parts(predictor, batch_i64, neg_i64):
 
 def init_stream_state(data, split, args, device):
     runtime = StructureComponentRuntime(data, args, device)
-    timeline = BTimeline(data["num_rels"], data["num_nodes"])
-    history = CausalHistory(data["num_nodes"], data["num_rels"])
+    num_rels = runtime_num_rels(data)
+    timeline = BTimeline(num_rels, data["num_nodes"])
+    history = CausalHistory(data["num_nodes"], num_rels)
     warmup = []
     if split == "train":
         warmup = [(snap, True) for snap in data["train_list"][: data["train_predict_start_idx"]]]
@@ -354,17 +382,18 @@ def init_stream_state(data, split, args, device):
     elif split == "test":
         warmup = [(snap, True) for snap in data["train_list"]]
         warmup.extend((snap, False) for snap in data["val_list"])
-    for (events, t_norm, _), is_train_update in warmup:
+    for (events, t_norm, t_orig), is_train_update in warmup:
         update_events = events_for_update(events, data, args, is_train=is_train_update)
-        runtime.update(update_events, t_norm)
+        runtime.update(update_events, model_time_value(data, t_norm, t_orig))
         timeline.update(update_events)
         history.update(update_events)
     return runtime, timeline, history
 
 
 def init_timeline_history_state(data, split, args):
-    timeline = BTimeline(data["num_rels"], data["num_nodes"])
-    history = CausalHistory(data["num_nodes"], data["num_rels"])
+    num_rels = runtime_num_rels(data)
+    timeline = BTimeline(num_rels, data["num_nodes"])
+    history = CausalHistory(data["num_nodes"], num_rels)
     warmup = []
     if split == "train":
         warmup = [(snap, True) for snap in data["train_list"][: data["train_predict_start_idx"]]]
@@ -544,7 +573,7 @@ def iter_structure_blocks(data, split, args, feature_builder, device):
                 t_orig=t_orig,
             )
         update_events = events_for_update(events, data, args, is_train=(split == "train"))
-        runtime.update(update_events, t_norm)
+        runtime.update(update_events, model_time_value(data, t_norm, t_orig))
         timeline.update(update_events)
         history.update(update_events)
 
@@ -581,7 +610,7 @@ def iter_component_blocks(data, split, args, device):
                 t_orig=t_orig,
             )
         update_events = events_for_update(events, data, args, is_train=(split == "train"))
-        runtime.update(update_events, t_norm)
+        runtime.update(update_events, model_time_value(data, t_norm, t_orig))
         timeline.update(update_events)
         history.update(update_events)
 
