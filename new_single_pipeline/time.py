@@ -4123,7 +4123,7 @@ def main(args):
         state = torch.load(best_path, map_location=device)
         model.load_state_dict(state)
         resumed_from_best_model = True
-        best_epoch = 0
+        best_epoch = max(0, int(getattr(args, "resume_best_epoch", 0) or 0))
         best_val_score = 0.0
         best_val_metrics = {}
         full_result = {
@@ -4184,34 +4184,54 @@ def main(args):
                 write_scores=True,
             )
         else:
-            print(
-                f"[TimeTKG] training OOF prefix model for {best_epoch} epochs "
-                f"on {len(train_prefix)} prefix timestamps",
-                flush=True,
-            )
+            oof_model_path = osp.join(out_dir, "oof_model.pt")
             model.to("cpu")
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            set_random_seed(args.seed)
-            oof_model = build_model(args, num_nodes, num_rels, t_min, t_max, device)
-            oof_result = train_model_phase(
-                oof_model,
-                train_prefix,
-                data,
-                make_optimizer(oof_model, args),
-                dst_pool,
-                args,
-                device,
-                num_rels,
-                num_nodes,
-                phase="oof",
-                num_epochs=best_epoch,
-                select_with_val=False,
-            )
-            oof_model_path = osp.join(out_dir, "oof_model.pt")
-            torch.save(oof_result["model"].state_dict(), oof_model_path)
+            if osp.isfile(oof_model_path) and not bool(getattr(args, "force", False)):
+                print(
+                    f"[TimeTKG] found existing oof_model.pt; loading and skipping OOF training: {oof_model_path}",
+                    flush=True,
+                )
+                oof_model = build_model(args, num_nodes, num_rels, t_min, t_max, device)
+                oof_model.load_state_dict(torch.load(oof_model_path, map_location=device))
+                oof_result = {
+                    "model": oof_model,
+                    "train_time_sec": 0.0,
+                    "train_peak_alloc_mb": 0.0,
+                    "train_peak_reserved_mb": 0.0,
+                    "reused_existing_oof_model": True,
+                }
+            elif bool(getattr(args, "require_existing_oof_model", False)):
+                raise FileNotFoundError(
+                    f"--require_existing_oof_model was set but no checkpoint was found: {oof_model_path}"
+                )
+            else:
+                oof_epochs = max(1, int(best_epoch))
+                print(
+                    f"[TimeTKG] training OOF prefix model for {oof_epochs} epochs "
+                    f"on {len(train_prefix)} prefix timestamps",
+                    flush=True,
+                )
+                set_random_seed(args.seed)
+                oof_model = build_model(args, num_nodes, num_rels, t_min, t_max, device)
+                oof_result = train_model_phase(
+                    oof_model,
+                    train_prefix,
+                    data,
+                    make_optimizer(oof_model, args),
+                    dst_pool,
+                    args,
+                    device,
+                    num_rels,
+                    num_nodes,
+                    phase="oof",
+                    num_epochs=oof_epochs,
+                    select_with_val=False,
+                )
+                torch.save(oof_result["model"].state_dict(), oof_model_path)
+                oof_model = oof_result["model"]
             oof_store = warmup_train_history(train_prefix, args, num_nodes, data=data)
-            oof_model = oof_result["model"]
             train_metrics = evaluate_split(
                 oof_model,
                 train_predict,
@@ -4348,6 +4368,7 @@ def main(args):
                 "oof_train_peak_alloc_mb": float(oof_result["train_peak_alloc_mb"]),
                 "oof_train_peak_reserved_mb": float(oof_result["train_peak_reserved_mb"]),
                 "oof_model_path": osp.join(out_dir, "oof_model.pt"),
+                "reused_existing_oof_model": bool(oof_result.get("reused_existing_oof_model", False)),
             }
         )
     if train_metrics is not None:

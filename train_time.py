@@ -138,6 +138,13 @@ def parse_args():
         default=False,
     )
     parser.add_argument("--require_existing_best_model", action="store_true", default=False)
+    parser.add_argument("--require_existing_oof_model", action="store_true", default=False)
+    parser.add_argument(
+        "--resume_best_epoch",
+        type=int,
+        default=0,
+        help="Best epoch to record/use when resuming from an existing best_model.pt without metrics.",
+    )
     parser.set_defaults(reuse_no_retrain_full=True)
     parser.add_argument("--no_reuse_no_retrain_full", dest="reuse_no_retrain_full", action="store_false")
     parser.add_argument("--profile_sync", action="store_true", default=False)
