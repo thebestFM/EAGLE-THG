@@ -698,7 +698,8 @@ def run(args):
         time_run,
         component_dir,
     )
-    best_record["all_rescue_presets"] = all_records
+    best_record = dict(best_record)
+    best_record["all_rescue_presets"] = [dict(record) for record in all_records]
     best_record["elapsed_s"] = time.time() - pair_t0
     pair_records.append(best_record)
     best_pair = best_record
