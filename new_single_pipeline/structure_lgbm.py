@@ -849,11 +849,161 @@ class HybridFeatureBuilder:
         return cube
 
 
+RESCUE_FEATURE_SUFFIXES = (
+    "score",
+    "z",
+    "minmax",
+    "rank_log",
+    "rank_recip",
+    "top10",
+    "top50",
+    "top100",
+)
+
+
+def rescue_prefixed_names(prefix):
+    return [f"{prefix}_{suffix}" for suffix in RESCUE_FEATURE_SUFFIXES]
+
+
+def rescue_ablation_remove_names(group):
+    group = str(group or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if group in ("", "none", "full"):
+        return set()
+    cross_core = {
+        "structure_minus_time",
+        "direct_minus_time",
+        "dsh_minus_time",
+        "dmh_minus_time",
+        "shared_minus_time",
+        "b_minus_time",
+        "abs_structure_minus_time",
+        "structure_times_time",
+        "direct_times_time",
+        "component_mean",
+        "component_max",
+        "component_min",
+        "component_std",
+        "rank_min_structure_time",
+        "rank_gap_structure_time",
+        "rank_gap_direct_time",
+        "structure_and_time_top10",
+        "structure_or_time_top10",
+        "structure_and_time_top50",
+        "structure_or_time_top50",
+        *rescue_prefixed_names("time_structure_base"),
+    }
+    structure_time_cross = {
+        "structure_minus_time",
+        "abs_structure_minus_time",
+        "structure_times_time",
+        "rank_min_structure_time",
+        "rank_gap_structure_time",
+        "structure_and_time_top10",
+        "structure_or_time_top10",
+        "structure_and_time_top50",
+        "structure_or_time_top50",
+        *rescue_prefixed_names("time_structure_base"),
+    }
+    component_stats = {"component_mean", "component_max", "component_min", "component_std"}
+    if group == "recurrence":
+        return {
+            *rescue_prefixed_names("b"),
+            "b_count_log1p",
+            "b_seen",
+            "tail_count_log1p",
+            "incident_count_log1p",
+            "rel_tail_count_log1p",
+            "source_count_log1p",
+            "rel_count_log1p",
+            "source_rel_log1p",
+            "exact_sro_log1p",
+            "source_tail_log1p",
+            "b_minus_time",
+            *component_stats,
+        }
+    if group == "direct":
+        return {
+            *rescue_prefixed_names("dsh"),
+            *rescue_prefixed_names("dmh"),
+            *rescue_prefixed_names("direct"),
+            *rescue_prefixed_names("structure_raw"),
+            *rescue_prefixed_names("base"),
+            "direct_minus_time",
+            "dsh_minus_time",
+            "dmh_minus_time",
+            "structure_minus_time",
+            "abs_structure_minus_time",
+            "structure_times_time",
+            "direct_times_time",
+            "rank_min_structure_time",
+            "rank_gap_structure_time",
+            "rank_gap_direct_time",
+            "structure_and_time_top10",
+            "structure_or_time_top10",
+            "structure_and_time_top50",
+            "structure_or_time_top50",
+            *rescue_prefixed_names("time_structure_base"),
+            *component_stats,
+        }
+    if group == "shared":
+        return {
+            *rescue_prefixed_names("shared"),
+            *rescue_prefixed_names("structure_raw"),
+            *rescue_prefixed_names("base"),
+            "shared_minus_time",
+            *structure_time_cross,
+            *component_stats,
+        }
+    if group == "time":
+        return {
+            *rescue_prefixed_names("time"),
+            "structure_minus_time",
+            "direct_minus_time",
+            "dsh_minus_time",
+            "dmh_minus_time",
+            "shared_minus_time",
+            "b_minus_time",
+            "abs_structure_minus_time",
+            "structure_times_time",
+            "direct_times_time",
+            "rank_min_structure_time",
+            "rank_gap_structure_time",
+            "rank_gap_direct_time",
+            "structure_and_time_top10",
+            "structure_or_time_top10",
+            "structure_and_time_top50",
+            "structure_or_time_top50",
+            *rescue_prefixed_names("time_structure_base"),
+            *component_stats,
+        }
+    if group in ("cross", "cross_signal", "cross_signals"):
+        return set(cross_core)
+    raise ValueError(
+        "unknown rescue hybrid ablation group "
+        f"{group!r}; expected recurrence,direct,shared,time,cross_signal"
+    )
+
+
 class RescueHybridFeatureBuilder:
-    def __init__(self, num_rels):
+    def __init__(self, num_rels, ablation_group=None):
         self.num_rels = int(num_rels)
         self.feature_names = []
         self._init_names()
+        self.full_feature_names = list(self.feature_names)
+        self.ablation_group = str(ablation_group or "").strip().lower()
+        self.removed_feature_names = sorted(
+            rescue_ablation_remove_names(self.ablation_group),
+            key=lambda name: self.full_feature_names.index(name) if name in self.full_feature_names else 10**9,
+        )
+        unknown = [name for name in self.removed_feature_names if name not in self.full_feature_names]
+        if unknown:
+            raise ValueError(f"ablation requested unknown feature names: {unknown}")
+        removed = set(self.removed_feature_names)
+        self.keep_feature_indices = np.asarray(
+            [idx for idx, name in enumerate(self.full_feature_names) if name not in removed],
+            dtype=np.int64,
+        )
+        self.feature_names = [self.full_feature_names[int(idx)] for idx in self.keep_feature_indices]
 
     def _add(self, name):
         self.feature_names.append(name)
@@ -985,6 +1135,8 @@ class RescueHybridFeatureBuilder:
         features.append((rels.reshape(-1, 1) >= self.num_rels // 2).repeat(valid.shape[1], axis=1).astype(np.float32))
         features.append((cand_ids == sources.reshape(-1, 1)).astype(np.float32, copy=False))
         cube = np.stack(features, axis=2).astype(np.float32, copy=False)
+        if len(self.keep_feature_indices) != len(self.full_feature_names):
+            cube = cube[:, :, self.keep_feature_indices]
         bad = int(np.size(cube) - np.sum(np.isfinite(cube)))
         if bad:
             raise RuntimeError(f"rescue hybrid feature cube has {bad} non-finite values")

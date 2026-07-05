@@ -344,37 +344,38 @@ def locate_structure_dir(args, sargs):
 
 
 def make_out_dir(args, run_spec):
-    h = stable_hash(
-        {
-            "protocol": PROTOCOL,
-            "dataset": args.dataset,
-            "run_spec": run_spec,
-            "structure_impl": getattr(tns, "NEW_STRUCTURE_IMPL", ""),
-            "seed": args.seed,
-            "ns_seed": args.ns_seed,
-            "train_predict_ratio": args.train_predict_ratio,
-            "rescue_topk": args.rescue_topk,
-            "rescue_min_pos_rank": args.rescue_min_pos_rank,
-            "rescue_max_pos_rank": args.rescue_max_pos_rank,
-            "rescue_exclude_top10": args.rescue_exclude_top10,
-            "hybrid_select_split": args.hybrid_select_split,
-            "hybrid_preset_indices": args.hybrid_preset_indices,
-            "component_splits": args.component_splits,
-            "skip_time_score_check": args.skip_time_score_check,
-            "skip_component_metrics": args.skip_component_metrics,
-            "skip_save_top10": args.skip_save_top10,
-            "max_hybrid_train_queries": args.max_hybrid_train_queries,
-            "hybrid_train_query_stride": args.hybrid_train_query_stride,
-            "hybrid_preset_hash": stable_hash(HYBRID_PARAM_PRESETS, length=10),
-            "focus_metric": args.focus_metric,
-            "b": {
-                "mode": args.b_mode,
-                "binary_unseen": args.b_binary_unseen,
-                "continuous_alpha": args.b_continuous_alpha,
-            },
+    hash_payload = {
+        "protocol": PROTOCOL,
+        "dataset": args.dataset,
+        "run_spec": run_spec,
+        "structure_impl": getattr(tns, "NEW_STRUCTURE_IMPL", ""),
+        "seed": args.seed,
+        "ns_seed": args.ns_seed,
+        "train_predict_ratio": args.train_predict_ratio,
+        "rescue_topk": args.rescue_topk,
+        "rescue_min_pos_rank": args.rescue_min_pos_rank,
+        "rescue_max_pos_rank": args.rescue_max_pos_rank,
+        "rescue_exclude_top10": args.rescue_exclude_top10,
+        "hybrid_select_split": args.hybrid_select_split,
+        "hybrid_preset_indices": args.hybrid_preset_indices,
+        "component_splits": args.component_splits,
+        "skip_time_score_check": args.skip_time_score_check,
+        "skip_component_metrics": args.skip_component_metrics,
+        "skip_save_top10": args.skip_save_top10,
+        "max_hybrid_train_queries": args.max_hybrid_train_queries,
+        "hybrid_train_query_stride": args.hybrid_train_query_stride,
+        "hybrid_preset_hash": stable_hash(HYBRID_PARAM_PRESETS, length=10),
+        "focus_metric": args.focus_metric,
+        "b": {
+            "mode": args.b_mode,
+            "binary_unseen": args.b_binary_unseen,
+            "continuous_alpha": args.b_continuous_alpha,
         },
-        12,
-    )
+    }
+    ablation = str(getattr(args, "ablation_feature_group", "") or "").strip()
+    if ablation:
+        hash_payload["ablation_feature_group"] = ablation
+    h = stable_hash(hash_payload, 12)
     return osp.join(args.output_root, args.dataset, f"seed{args.seed}", f"save_top10_{h}")
 
 
@@ -439,9 +440,19 @@ def selected_hybrid_presets(args):
 
 def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time_run, component_dir):
     num_rels = tns.runtime_num_rels(data) if hasattr(tns, "runtime_num_rels") else data["num_rels"]
-    rescue_feature_builder = RescueHybridFeatureBuilder(num_rels)
+    rescue_feature_builder = RescueHybridFeatureBuilder(
+        num_rels,
+        ablation_group=getattr(args, "ablation_feature_group", ""),
+    )
     time_dir = time_run["dir"]
     include_top10 = not bool(getattr(args, "rescue_exclude_top10", False))
+    if getattr(args, "ablation_feature_group", ""):
+        print(
+            f"[SaveTop10][ablation] group={args.ablation_feature_group} "
+            f"kept={len(rescue_feature_builder.feature_names)}/{len(rescue_feature_builder.full_feature_names)} "
+            f"removed={rescue_feature_builder.removed_feature_names}",
+            flush=True,
+        )
     print(
         f"[SaveTop10][rescue] build train matrix struct={struct_id} time={time_run['id']} "
         f"topk={int(args.rescue_topk)} pos_rank={int(args.rescue_min_pos_rank)}..{int(args.rescue_max_pos_rank)} "
@@ -555,6 +566,11 @@ def train_best_rescue_hybrid(data, sargs, args, device, out_dir, struct_id, time
             "time_id": time_run["id"],
             "time_dir": time_dir,
             "rescue_topk": int(args.rescue_topk),
+            "ablation_feature_group": str(getattr(args, "ablation_feature_group", "") or ""),
+            "full_feature_count": int(len(rescue_feature_builder.full_feature_names)),
+            "kept_feature_count": int(len(rescue_feature_builder.feature_names)),
+            "kept_feature_names": list(rescue_feature_builder.feature_names),
+            "removed_feature_names": list(rescue_feature_builder.removed_feature_names),
         }
     )
     return best["record"], records
@@ -732,8 +748,8 @@ def run(args):
     return summary
 
 
-def parse_args():
-    parser = argparse.ArgumentParser("Rescue-style topK hybrid reranker that saves test top10 per query.")
+def build_arg_parser(description="Rescue-style topK hybrid reranker that saves test top10 per query."):
+    parser = argparse.ArgumentParser(description)
     parser.add_argument("--dataset", default="ICEWS14")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--ns_q", type=int, default=1000)
@@ -856,7 +872,11 @@ def parse_args():
     parser.add_argument("--b_mode", choices=("continuous", "binary"), default="continuous")
     parser.add_argument("--b_binary_unseen", type=float, default=0.0)
     parser.add_argument("--b_continuous_alpha", type=float, default=0.0001)
-    return parser.parse_args()
+    return parser
+
+
+def parse_args():
+    return build_arg_parser().parse_args()
 
 
 if __name__ == "__main__":
