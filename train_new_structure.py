@@ -3794,6 +3794,7 @@ def parse_args():
     parser = argparse.ArgumentParser('Run one new-structure configuration and report strict ranking metrics.')
     parser.add_argument('--dataset', default='ICEWS14')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--output_root', default='results_new_structure')
     parser.add_argument('--ns_q', type=int, default=None)
     parser.add_argument('--ns_seed', type=int, default=42)
     parser.add_argument('--train_predict_ratio', type=float, default=0.3)
