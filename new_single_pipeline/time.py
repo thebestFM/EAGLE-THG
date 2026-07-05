@@ -32,6 +32,50 @@ DEFAULT_CALENDAR_ABS_PERIODS = [1.0, 7.0, 30.0, 365.0]
 DEFAULT_SECONDS_ABS_PERIODS = [86400.0, 604800.0, 2592000.0, 31536000.0]
 SECONDS_PER_DAY = 86400.0
 THG_NODE_FEATURE_DIM = 3
+TIME_ABLATIONS = {"none", "no_time", "no_relation", "no_geo"}
+
+
+def normalize_time_ablation(value):
+    value = str(value or "none").strip().lower().replace("-", "_")
+    aliases = {
+        "full": "none",
+        "wo_time": "no_time",
+        "without_time": "no_time",
+        "no_delta_t": "no_time",
+        "no_delta_abs": "no_time",
+        "no_delta_t_abs_time": "no_time",
+        "wo_delta_t_abs_time": "no_time",
+        "wo_relation": "no_relation",
+        "without_relation": "no_relation",
+        "no_rel": "no_relation",
+        "no_relation_embedding": "no_relation",
+        "wo_geo": "no_geo",
+        "without_geo": "no_geo",
+        "no_yelp_geo": "no_geo",
+    }
+    value = aliases.get(value, value)
+    if value not in TIME_ABLATIONS:
+        raise ValueError(
+            f"unknown --time_ablation {value!r}; expected one of: {', '.join(sorted(TIME_ABLATIONS))}"
+        )
+    return value
+
+
+def apply_time_ablation_args(args):
+    args.time_ablation = normalize_time_ablation(getattr(args, "time_ablation", "none"))
+    if not hasattr(args, "use_delta_t"):
+        args.use_delta_t = True
+    if not hasattr(args, "use_relation_embedding"):
+        args.use_relation_embedding = True
+    if args.time_ablation == "no_time":
+        args.use_delta_t = False
+        args.use_abs_time = False
+    if args.time_ablation == "no_relation":
+        args.use_relation_embedding = False
+        args.use_query_gate = False
+    if args.time_ablation == "no_geo":
+        args.use_node_geo = False
+    return args
 
 
 def profile_add(profile, key, value):
@@ -398,6 +442,8 @@ class RecentEventEncoder(nn.Module):
         channel_expansion_factor=4.0,
         use_single_layer=False,
         relation_embedding=None,
+        use_delta_t=True,
+        use_relation_embedding=True,
         use_abs_time=False,
         abs_time_periods=None,
         abs_time_harmonics=1,
@@ -414,16 +460,28 @@ class RecentEventEncoder(nn.Module):
         self.num_rels = num_rels
         self.topk = topk
         self.use_neighbor_id = use_neighbor_id
+        self.use_delta_t = bool(use_delta_t)
+        self.use_relation_embedding = bool(use_relation_embedding)
         self.use_abs_time = use_abs_time
-        self.use_query_gate = use_query_gate
+        self.use_query_gate = bool(use_query_gate and self.use_relation_embedding)
         self.query_gate_type = query_gate_type
         self.use_rank_pos = use_rank_pos
         self.node_feature_dim = int(node_feature_dim or 0)
-        self.time_encoder = MultiScaleTimeEncode(time_dim, t_min=t_min, t_max=t_max)
-        self.relation_embedding = relation_embedding or nn.Embedding(
-            num_rels + 1, rel_dim, padding_idx=num_rels
+        self.time_encoder = (
+            MultiScaleTimeEncode(time_dim, t_min=t_min, t_max=t_max)
+            if self.use_delta_t
+            else None
         )
-        input_dim = time_dim + rel_dim
+        self.relation_embedding = (
+            relation_embedding or nn.Embedding(num_rels + 1, rel_dim, padding_idx=num_rels)
+            if self.use_relation_embedding
+            else None
+        )
+        input_dim = 0
+        if self.use_delta_t:
+            input_dim += time_dim
+        if self.use_relation_embedding:
+            input_dim += rel_dim
         if use_abs_time:
             self.abs_time_encoder = PeriodicTimeEncode(
                 periods=abs_time_periods or [1.0, 7.0, 30.0],
@@ -455,7 +513,7 @@ class RecentEventEncoder(nn.Module):
         self.event_norm = nn.LayerNorm(event_dim)
         self.event_dropout = nn.Dropout(dropout)
 
-        if use_query_gate:
+        if self.use_query_gate:
             if query_gate_type == "scalar":
                 gate_dim = 1
             elif query_gate_type == "channel":
@@ -511,9 +569,11 @@ class RecentEventEncoder(nn.Module):
         query_rel=None,
     ):
         mask_f = mask.unsqueeze(-1).float()
-        time_feat = self.time_encoder(delta_t) * mask_f
-        rel_feat = self.relation_embedding(rel_ids)
-        pieces = [time_feat, rel_feat]
+        pieces = []
+        if self.time_encoder is not None:
+            pieces.append(self.time_encoder(delta_t) * mask_f)
+        if self.use_relation_embedding:
+            pieces.append(self.relation_embedding(rel_ids))
         if self.abs_time_encoder is not None:
             pieces.append(self.abs_time_encoder(event_times) * mask_f)
         node_piece = None
@@ -523,8 +583,8 @@ class RecentEventEncoder(nn.Module):
             if node_features is None:
                 node_features = torch.zeros(
                     (*neighbor_ids.shape, self.node_feature_dim),
-                    dtype=time_feat.dtype,
-                    device=time_feat.device,
+                    dtype=mask_f.dtype,
+                    device=mask_f.device,
                 )
             feature_piece = self.node_feature_proj(node_features.float()) * mask_f
             node_piece = feature_piece if node_piece is None else node_piece + feature_piece
@@ -664,11 +724,16 @@ class RelationAwareEdgePredictor(nn.Module):
         dropout,
         predictor_mode,
         relation_embedding,
+        use_relation_embedding=True,
     ):
         super().__init__()
         self.predictor_mode = predictor_mode
         self.relation_embedding = relation_embedding
-        if predictor_mode == "diag":
+        self.use_relation_embedding = bool(use_relation_embedding)
+        if not self.use_relation_embedding:
+            self.rel_proj = None
+            input_dim = event_dim + event_dim
+        elif predictor_mode == "diag":
             self.rel_proj = nn.Sequential(
                 nn.Linear(rel_dim, event_dim),
                 nn.LayerNorm(event_dim),
@@ -691,10 +756,14 @@ class RelationAwareEdgePredictor(nn.Module):
         )
 
     def forward(self, h_src, h_dst, query_rel, src_node_emb, dst_node_emb):
-        r = self.relation_embedding(query_rel)
-        if self.predictor_mode == "diag":
-            h_src = h_src * self.rel_proj(r)
-        x = torch.cat((h_src, h_dst, r, src_node_emb, dst_node_emb), dim=-1)
+        pieces = [h_src, h_dst]
+        if self.use_relation_embedding:
+            r = self.relation_embedding(query_rel)
+            if self.predictor_mode == "diag":
+                h_src = h_src * self.rel_proj(r)
+                pieces[0] = h_src
+            pieces.append(r)
+        x = torch.cat((*pieces, src_node_emb, dst_node_emb), dim=-1)
         return self.mlp(x).squeeze(-1)
 
 
@@ -718,6 +787,8 @@ class TKGTimeMixer(nn.Module):
         channel_expansion_factor=4.0,
         use_single_layer=False,
         predictor_mode="diag",
+        use_delta_t=True,
+        use_relation_embedding=True,
         use_abs_time=False,
         abs_time_periods=None,
         abs_time_harmonics=1,
@@ -733,11 +804,17 @@ class TKGTimeMixer(nn.Module):
         node_feature_dim=0,
     ):
         super().__init__()
-        self.relation_embedding = nn.Embedding(num_rels + 1, rel_dim, padding_idx=num_rels)
-        self.entity_embedding = nn.Embedding(num_nodes + 1, node_dim, padding_idx=num_nodes)
         self.num_nodes = int(num_nodes)
         self.use_cross_history = use_cross_history
-        self.use_query_gate = use_query_gate
+        self.use_delta_t = bool(use_delta_t)
+        self.use_relation_embedding = bool(use_relation_embedding)
+        self.use_query_gate = bool(use_query_gate and self.use_relation_embedding)
+        self.relation_embedding = (
+            nn.Embedding(num_rels + 1, rel_dim, padding_idx=num_rels)
+            if self.use_relation_embedding
+            else None
+        )
+        self.entity_embedding = nn.Embedding(num_nodes + 1, node_dim, padding_idx=num_nodes)
         self.node_feature_dim = int(node_feature_dim or 0)
         if self.node_feature_dim > 0:
             self.static_node_feature_proj = nn.Sequential(
@@ -764,10 +841,12 @@ class TKGTimeMixer(nn.Module):
             channel_expansion_factor=channel_expansion_factor,
             use_single_layer=use_single_layer,
             relation_embedding=self.relation_embedding,
+            use_delta_t=self.use_delta_t,
+            use_relation_embedding=self.use_relation_embedding,
             use_abs_time=use_abs_time,
             abs_time_periods=abs_time_periods,
             abs_time_harmonics=abs_time_harmonics,
-            use_query_gate=use_query_gate,
+            use_query_gate=self.use_query_gate,
             query_gate_type=query_gate_type,
             use_rank_pos=use_rank_pos,
             encoder_backend=encoder_backend,
@@ -807,6 +886,7 @@ class TKGTimeMixer(nn.Module):
             dropout=dropout,
             predictor_mode=predictor_mode,
             relation_embedding=self.relation_embedding,
+            use_relation_embedding=self.use_relation_embedding,
         )
 
     @staticmethod
@@ -2058,6 +2138,9 @@ def source_cache_signature(args):
         "channel_expansion_factor",
         "use_single_layer",
         "predictor_mode",
+        "time_ablation",
+        "use_delta_t",
+        "use_relation_embedding",
         "use_neighbor_id",
         "use_abs_time",
         "abs_time_periods",
@@ -3471,10 +3554,12 @@ def build_model(args, num_nodes, num_rels, t_min, t_max, device):
         channel_expansion_factor=args.channel_expansion_factor,
         use_single_layer=args.use_single_layer,
         predictor_mode=args.predictor_mode,
+        use_delta_t=getattr(args, "use_delta_t", True),
+        use_relation_embedding=getattr(args, "use_relation_embedding", True),
         use_abs_time=getattr(args, "use_abs_time", False),
         abs_time_periods=abs_periods,
         abs_time_harmonics=getattr(args, "abs_time_harmonics", 1),
-        use_query_gate=getattr(args, "use_query_gate", False),
+        use_query_gate=bool(getattr(args, "use_query_gate", False) and getattr(args, "use_relation_embedding", True)),
         query_gate_type=getattr(args, "query_gate_type", "channel"),
         use_rank_pos=getattr(args, "use_rank_pos", False),
         multi_windows=multi_windows,
@@ -3734,6 +3819,9 @@ def get_run_params(args):
         "cef": args.channel_expansion_factor,
         "sl": int(args.use_single_layer),
         "pred": args.predictor_mode,
+        "abl": getattr(args, "time_ablation", "none"),
+        "delta": int(getattr(args, "use_delta_t", True)),
+        "reluse": int(getattr(args, "use_relation_embedding", True)),
         "enc": getattr(args, "event_encoder", "mixer"),
         "th": getattr(args, "transformer_heads", 2),
         "tff": getattr(args, "transformer_ff_dim", None) or 0,
@@ -3826,6 +3914,8 @@ def get_out_dir(args):
         f"_rank{params['rank']}"
         f"_loss{params['loss']}"
     )
+    if params.get("abl") and params["abl"] != "none":
+        name += f"_abl{params['abl']}"
     if params.get("nrt"):
         name += "_no_retrain_on_train_prefix"
     if len(name) > 180:
@@ -3911,6 +4001,9 @@ def print_epoch_profile(epoch, args, model, train_profile, val_profile, device, 
         f"preload={int(getattr(args, 'preload_eval_nodes', True))} "
         f"dense={int(getattr(args, 'dense_eval_node_cache', True))} "
         f"event_dim={args.event_dim} hidden_dim={args.hidden_dim} time_dim={args.time_dim} "
+        f"ablation={getattr(args, 'time_ablation', 'none')} "
+        f"delta={int(getattr(args, 'use_delta_t', True))} "
+        f"rel={int(getattr(args, 'use_relation_embedding', True))} "
         f"abs={int(getattr(args, 'use_abs_time', False))} "
         f"rank={int(getattr(args, 'use_rank_pos', False))} "
         f"gate={int(getattr(args, 'use_query_gate', False))} "
@@ -3928,6 +4021,7 @@ def print_epoch_profile(epoch, args, model, train_profile, val_profile, device, 
 
 
 def validate_args(args):
+    apply_time_ablation_args(args)
     if not hasattr(args, "reuse_no_retrain_full"):
         args.reuse_no_retrain_full = True
     if not hasattr(args, "use_node_geo"):

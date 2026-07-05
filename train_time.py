@@ -15,13 +15,55 @@ THG_DATASETS = {
     "Yelp-BNA",
 }
 
+TIME_ABLATIONS = {
+    "none",
+    "no_time",
+    "no_relation",
+    "no_geo",
+}
+
+
+def normalize_time_ablation(value):
+    value = str(value or "none").strip().lower().replace("-", "_")
+    aliases = {
+        "full": "none",
+        "wo_time": "no_time",
+        "without_time": "no_time",
+        "no_delta_t": "no_time",
+        "no_delta_abs": "no_time",
+        "no_delta_t_abs_time": "no_time",
+        "wo_delta_t_abs_time": "no_time",
+        "wo_relation": "no_relation",
+        "without_relation": "no_relation",
+        "no_rel": "no_relation",
+        "no_relation_embedding": "no_relation",
+        "wo_geo": "no_geo",
+        "without_geo": "no_geo",
+        "no_yelp_geo": "no_geo",
+    }
+    value = aliases.get(value, value)
+    if value not in TIME_ABLATIONS:
+        raise ValueError(
+            f"unknown --time_ablation {value!r}; expected one of: {', '.join(sorted(TIME_ABLATIONS))}"
+        )
+    return value
+
 
 def normalize_args(args):
+    args.time_ablation = normalize_time_ablation(getattr(args, "time_ablation", "none"))
     is_thg = args.dataset in THG_DATASETS
     if args.use_node_geo is None:
         args.use_node_geo = bool(is_thg)
     if args.thg_time_days is None:
         args.thg_time_days = bool(is_thg)
+    args.use_delta_t = args.time_ablation != "no_time"
+    args.use_relation_embedding = args.time_ablation != "no_relation"
+    if args.time_ablation == "no_time":
+        args.use_abs_time = False
+    if args.time_ablation == "no_relation":
+        args.use_query_gate = False
+    if args.time_ablation == "no_geo":
+        args.use_node_geo = False
     return args
 
 
@@ -48,6 +90,7 @@ def parse_args():
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--output_dir", default="")
     parser.add_argument("--force", action="store_true", default=False)
+    parser.add_argument("--time_ablation", default="none")
 
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--eval_batch_size", type=int, default=256)
