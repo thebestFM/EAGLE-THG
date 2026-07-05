@@ -39,7 +39,7 @@ SECONDS_PER_DAY = 86400.0
 DSH_GLOBAL_LAZY_SAFE_EXP = 650.0
 DSH_BUCKET_CLEAR_EXP = 700.0
 DSH_BUCKET_MATERIALIZE_SCALE = 1e-100
-STRUCTURE_ABLATIONS = ('none', 'no_beta', 'no_mtrans')
+STRUCTURE_ABLATIONS = ('none', 'no_beta', 'no_mtrans', 'no_direct')
 
 
 def normalize_structure_ablation_value(value):
@@ -60,6 +60,10 @@ def ablate_ppr_beta(args):
 
 def ablate_m_trans(args):
     return normalize_structure_ablation_value(getattr(args, 'structure_ablation', 'none')) == 'no_mtrans'
+
+
+def ablate_direct(args):
+    return normalize_structure_ablation_value(getattr(args, 'structure_ablation', 'none')) == 'no_direct'
 
 
 def effective_ppr_beta(args):
@@ -2227,7 +2231,8 @@ class FastPerRelSourceJoinPredictor:
         batch_i64 = np.ascontiguousarray(batch_data.astype(np.int64, copy=False))
         neg_i64 = np.ascontiguousarray(neg_samples_arr.astype(np.int64, copy=False))
         gamma = float(gamma)
-        need_shared = abs(gamma) > 1e-12
+        only_shared = getattr(self, 'structure_ablation', 'none') == 'no_direct'
+        need_shared = abs(gamma) > 1e-12 or only_shared
         pos_direct = np.zeros((batch_i64.shape[0], 1), dtype=np.float32)
         neg_direct = np.zeros(neg_i64.shape, dtype=np.float32)
         dsh_pos = np.zeros_like(pos_direct)
@@ -2244,7 +2249,7 @@ class FastPerRelSourceJoinPredictor:
 
         pos_shared = np.zeros((batch_i64.shape[0], 1), dtype=np.float32)
         neg_shared = np.zeros(neg_i64.shape, dtype=np.float32)
-        use_top_direct = self.top_direct >= 0
+        use_top_direct = self.top_direct >= 0 and not only_shared
         if use_top_direct:
             self._pred_epoch = _fast_perrel_predict_batch(
                 self.entry_keys, self.rel_keys, self.rel_scores, self.entry_lens,
@@ -2267,6 +2272,8 @@ class FastPerRelSourceJoinPredictor:
             self.top_share, pos_direct, neg_direct, pos_shared, neg_shared,
             use_top_direct, pos_shared_mask, neg_shared_mask,
         )
+        if only_shared:
+            return gamma * pos_shared, gamma * neg_shared
         if not use_top_direct:
             dsh_pos, dsh_neg = direct_scorer.predict_batch(batch_i64, neg_i64)
         new_pos_direct, new_neg_direct = _combine_direct_scores(
@@ -2600,8 +2607,11 @@ class SharedPredictor:
 
     def predict_batch(self, batch_data, neg_samples_arr, gamma, direct_scorer, direct_single_hop):
         gamma = float(gamma)
-        need_shared = abs(gamma) > 1e-12
+        only_shared = getattr(self, 'structure_ablation', 'none') == 'no_direct'
+        need_shared = abs(gamma) > 1e-12 or only_shared
         d_pos, d_neg, s_pos, s_neg = self._predict_parts(batch_data, neg_samples_arr, need_shared)
+        if only_shared:
+            return gamma * s_pos, gamma * s_neg
         dsh_pos, dsh_neg = direct_scorer.predict_batch(
             np.ascontiguousarray(batch_data.astype(np.int64, copy=False)),
             np.ascontiguousarray(neg_samples_arr.astype(np.int64, copy=False)),
@@ -2880,7 +2890,8 @@ class FastTagMaxArrayPredictor:
         batch_i64 = np.ascontiguousarray(batch_data.astype(np.int64, copy=False))
         neg_i64 = np.ascontiguousarray(neg_samples_arr.astype(np.int64, copy=False))
         gamma = float(gamma)
-        need_shared = abs(gamma) > 1e-12
+        only_shared = getattr(self, 'structure_ablation', 'none') == 'no_direct'
+        need_shared = abs(gamma) > 1e-12 or only_shared
         pos_direct = np.zeros((batch_i64.shape[0], 1), dtype=np.float32)
         neg_direct = np.zeros(neg_i64.shape, dtype=np.float32)
         dsh_pos = np.zeros_like(pos_direct)
@@ -2897,7 +2908,7 @@ class FastTagMaxArrayPredictor:
 
         pos_shared = np.zeros((batch_i64.shape[0], 1), dtype=np.float32)
         neg_shared = np.zeros(neg_i64.shape, dtype=np.float32)
-        use_top_direct = self.top_direct >= 0
+        use_top_direct = self.top_direct >= 0 and not only_shared
         if use_top_direct:
             self._pred_epoch = _fast_tagmax_predict_batch(
                 self.keys, self.scores, self.tags, self.lens, self.M_sim_np,
@@ -2920,6 +2931,8 @@ class FastTagMaxArrayPredictor:
             pos_direct, neg_direct, pos_shared, neg_shared,
             use_top_direct, pos_shared_mask, neg_shared_mask,
         )
+        if only_shared:
+            return gamma * pos_shared, gamma * neg_shared
         if not use_top_direct:
             dsh_pos, dsh_neg = direct_scorer.predict_batch(batch_i64, neg_i64)
         new_pos_direct, new_neg_direct = _combine_direct_scores(
@@ -3574,6 +3587,7 @@ def build_runtime(args, num_nodes, num_rels, device):
             ppr_alpha=args.ppr_alpha, ppr_beta=beta_eff, device=device,
             top_share=args.top_share, top_direct=getattr(args, 'top_direct', -1),
         )
+    predictor.structure_ablation = ablation
 
     semantic_updater = SemanticMatrixUpdater(
         num_nodes=num_nodes, num_rels=num_rels,
@@ -3600,6 +3614,12 @@ def build_runtime(args, num_nodes, num_rels, device):
             f'effective_ppr_beta={beta_eff:g}',
             flush=True,
         )
+    if ablation == 'no_direct':
+        print(
+            '[Shared][ablation] no_direct: final structure score uses only gamma * shared; '
+            'top_direct gating is disabled for shared computation',
+            flush=True,
+        )
 
     return predictor, semantic_updater, logic_updater
 
@@ -3613,8 +3633,10 @@ def save_result(args, val_metrics, test_metrics=None, runtime_stats=None, train_
     cfg['structure_ablation'] = normalize_structure_ablation_value(getattr(args, 'structure_ablation', 'none'))
     cfg['effective_ppr_beta'] = effective_ppr_beta(args)
     cfg['m_trans_is_all_ones'] = bool(ablate_m_trans(args))
+    cfg['direct_removed'] = bool(ablate_direct(args))
     cfg['score_formula'] = (
-        'direct_single_hop * dsh + (1 - direct_single_hop) * dmh + gamma * shared'
+        'gamma * shared' if ablate_direct(args)
+        else 'direct_single_hop * dsh + (1 - direct_single_hop) * dmh + gamma * shared'
     )
 
     metrics = {
@@ -3747,6 +3769,7 @@ def main(args):
     args.structure_ablation = normalize_structure_ablation_value(getattr(args, 'structure_ablation', 'none'))
     args.effective_ppr_beta = effective_ppr_beta(args)
     args.m_trans_is_all_ones = bool(ablate_m_trans(args))
+    args.direct_removed = bool(ablate_direct(args))
     args.gamma = float(args.gamma)
     args.direct_single_hop = float(args.direct_single_hop)
     args.decay_direct = float(args.decay_direct)
