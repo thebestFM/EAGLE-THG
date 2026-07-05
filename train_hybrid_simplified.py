@@ -25,6 +25,25 @@ from utils import (
 PROTOCOL = "hybrid_simplified_no_recurrence_v1"
 COMPONENT_SCORE_NAMES = ("dsh", "dmh", "shared", "direct", "structure_raw")
 FEATURE_SUFFIXES = ("score", "z", "minmax", "rank_log", "rank_recip", "top10", "top50", "top100")
+SCORE_PREFIXES = ("structure_raw", "time", "dsh", "dmh", "direct", "shared", "base", "time_structure_base")
+CROSS_FEATURE_NAMES = (
+    "structure_minus_time",
+    "direct_minus_time",
+    "dsh_minus_time",
+    "dmh_minus_time",
+    "shared_minus_time",
+    "abs_structure_minus_time",
+    "structure_times_time",
+    "direct_times_time",
+    "rank_min_structure_time",
+    "rank_gap_structure_time",
+    "rank_gap_direct_time",
+    "structure_and_time_top10",
+    "structure_or_time_top10",
+    "structure_and_time_top50",
+    "structure_or_time_top50",
+)
+META_FEATURE_NAMES = ("relation_is_inverse", "candidate_is_source")
 EPS = 1e-12
 
 
@@ -134,41 +153,91 @@ def load_score_matrix(store, row_offset, rows, width):
     return scores, valid
 
 
+def prefixed_feature_names(prefixes):
+    out = []
+    for prefix in prefixes:
+        out.extend(f"{prefix}_{suffix}" for suffix in FEATURE_SUFFIXES)
+    return out
+
+
+def structure_cross_feature_names():
+    return [
+        "structure_minus_time",
+        "abs_structure_minus_time",
+        "structure_times_time",
+        "rank_min_structure_time",
+        "rank_gap_structure_time",
+        "structure_and_time_top10",
+        "structure_or_time_top10",
+        "structure_and_time_top50",
+        "structure_or_time_top50",
+    ]
+
+
+def ablation_remove_names(group):
+    group = str(group or "none").strip().lower().replace("-", "_")
+    if group in ("", "none", "full"):
+        return set()
+    if group == "time":
+        return {name for name in prefixed_feature_names(SCORE_PREFIXES) + list(CROSS_FEATURE_NAMES) if "time" in name}
+    if group == "direct":
+        remove = set(prefixed_feature_names(("dsh", "dmh", "direct", "structure_raw", "base", "time_structure_base")))
+        remove.update(
+            [
+                "direct_minus_time",
+                "dsh_minus_time",
+                "dmh_minus_time",
+                "direct_times_time",
+                "rank_gap_direct_time",
+            ]
+        )
+        remove.update(structure_cross_feature_names())
+        return remove
+    if group == "shared":
+        remove = set(prefixed_feature_names(("shared", "structure_raw", "base", "time_structure_base")))
+        remove.add("shared_minus_time")
+        remove.update(structure_cross_feature_names())
+        return remove
+    if group == "structure":
+        remove = set(prefixed_feature_names(("structure_raw", "time_structure_base")))
+        remove.update(structure_cross_feature_names())
+        return remove
+    if group == "cross":
+        return set(CROSS_FEATURE_NAMES)
+    if group == "meta":
+        return set(META_FEATURE_NAMES)
+    raise ValueError(f"unknown ablation group: {group}")
+
+
 class SimplifiedFeatureBuilder:
-    def __init__(self, num_rels):
+    def __init__(self, num_rels, ablation_group="none"):
         self.num_rels = int(num_rels)
-        self.feature_names = []
+        self.ablation_group = str(ablation_group or "none").strip().lower().replace("-", "_")
+        self.full_feature_names = []
         self._init_names()
+        remove = ablation_remove_names(self.ablation_group)
+        known = set(self.full_feature_names)
+        unknown = sorted(remove - known)
+        if unknown:
+            raise RuntimeError(f"ablation {self.ablation_group} contains unknown features: {unknown}")
+        self.removed_feature_names = [name for name in self.full_feature_names if name in remove]
+        self.keep_feature_mask = np.asarray([name not in remove for name in self.full_feature_names], dtype=bool)
+        self.keep_feature_indices = np.flatnonzero(self.keep_feature_mask)
+        self.feature_names = [name for name in self.full_feature_names if name not in remove]
+        if not self.feature_names:
+            raise ValueError(f"ablation {self.ablation_group} removed all features")
 
     def _add(self, name):
-        self.feature_names.append(name)
+        self.full_feature_names.append(name)
 
     def _add_score_prefix(self, prefix):
         for suffix in FEATURE_SUFFIXES:
             self._add(f"{prefix}_{suffix}")
 
     def _init_names(self):
-        for prefix in ("structure_raw", "time", "dsh", "dmh", "direct", "shared", "base", "time_structure_base"):
+        for prefix in SCORE_PREFIXES:
             self._add_score_prefix(prefix)
-        for name in (
-            "structure_minus_time",
-            "direct_minus_time",
-            "dsh_minus_time",
-            "dmh_minus_time",
-            "shared_minus_time",
-            "abs_structure_minus_time",
-            "structure_times_time",
-            "direct_times_time",
-            "rank_min_structure_time",
-            "rank_gap_structure_time",
-            "rank_gap_direct_time",
-            "structure_and_time_top10",
-            "structure_or_time_top10",
-            "structure_and_time_top50",
-            "structure_or_time_top50",
-            "relation_is_inverse",
-            "candidate_is_source",
-        ):
+        for name in CROSS_FEATURE_NAMES + META_FEATURE_NAMES:
             self._add(name)
 
     def make(self, scores, time_scores, valid, batch_data, cand_ids):
@@ -187,7 +256,7 @@ class SimplifiedFeatureBuilder:
         ranks = {name: dense_rank(value, valid).astype(np.float32, copy=False) for name, value in score_map.items()}
 
         features = []
-        for prefix in ("structure_raw", "time", "dsh", "dmh", "direct", "shared", "base", "time_structure_base"):
+        for prefix in SCORE_PREFIXES:
             score = np.where(valid, score_map[prefix], 0.0).astype(np.float32, copy=False)
             rank = ranks[prefix]
             features.extend(
@@ -236,8 +305,10 @@ class SimplifiedFeatureBuilder:
         features.append((rels.reshape(-1, 1) >= self.num_rels // 2).repeat(valid.shape[1], axis=1).astype(np.float32))
         features.append((cand_ids == sources.reshape(-1, 1)).astype(np.float32, copy=False))
         cube = np.stack(features, axis=2).astype(np.float32, copy=False)
-        if cube.shape[2] != len(self.feature_names):
-            raise RuntimeError(f"feature count mismatch: cube={cube.shape[2]} names={len(self.feature_names)}")
+        if cube.shape[2] != len(self.full_feature_names):
+            raise RuntimeError(f"feature count mismatch: cube={cube.shape[2]} names={len(self.full_feature_names)}")
+        if len(self.keep_feature_indices) != len(self.full_feature_names):
+            cube = cube[:, :, self.keep_feature_indices]
         bad = int(np.size(cube) - np.sum(np.isfinite(cube)))
         if bad:
             raise RuntimeError(f"simplified hybrid feature cube has {bad} non-finite values")
@@ -517,6 +588,7 @@ def make_out_dir(args, component_dir):
         "time_dir": args.time_dir,
         "structure_dir": args.structure_dir,
         "component_dir": component_dir,
+        "ablation": args.ablation,
         "rescue_topk": args.rescue_topk,
         "rescue_min_pos_rank": args.rescue_min_pos_rank,
         "rescue_max_pos_rank": args.rescue_max_pos_rank,
@@ -539,6 +611,8 @@ def make_out_dir(args, component_dir):
 
 
 def validate_args(args):
+    args.ablation = str(getattr(args, "ablation", "none") or "none").strip().lower().replace("-", "_")
+    ablation_remove_names(args.ablation)
     if int(args.query_batch_size) <= 0:
         raise ValueError("--query_batch_size must be > 0")
     if int(args.rescue_topk) <= 0:
@@ -565,7 +639,7 @@ def run(args):
     print(f"[HybridSimplified] output -> {out_dir}", flush=True)
     print(
         f"[HybridSimplified] protocol={PROTOCOL} dataset={args.dataset} "
-        f"ns_q={args.ns_q} select_split={args.hybrid_select_split}",
+        f"ns_q={args.ns_q} select_split={args.hybrid_select_split} ablation={args.ablation}",
         flush=True,
     )
     data = load_datasets(
@@ -583,12 +657,14 @@ def run(args):
     print(f"[HybridSimplified][time] test {format_metrics(time_metrics)}", flush=True)
 
     num_rels = int(data.get("num_rels_raw", data["num_rels"])) * 2 if data.get("is_thg", False) else int(data["num_rels"])
-    feature_builder = SimplifiedFeatureBuilder(num_rels)
+    feature_builder = SimplifiedFeatureBuilder(num_rels, ablation_group=args.ablation)
     print(
-        f"[HybridSimplified] features={len(feature_builder.feature_names)} "
-        f"names={feature_builder.feature_names}",
+        f"[HybridSimplified] features={len(feature_builder.feature_names)}/{len(feature_builder.full_feature_names)} "
+        f"removed={len(feature_builder.removed_feature_names)} names={feature_builder.feature_names}",
         flush=True,
     )
+    if feature_builder.removed_feature_names:
+        print(f"[HybridSimplified][ablation] removed={feature_builder.removed_feature_names}", flush=True)
 
     t0 = time.time()
     X_train, y_train, group, train_info = build_train_matrix(data, args, feature_builder, args.time_dir, component_dir)
@@ -616,7 +692,11 @@ def run(args):
         "time_dir": args.time_dir,
         "structure_dir": args.structure_dir,
         "component_dir": component_dir,
+        "ablation": args.ablation,
+        "full_feature_names": feature_builder.full_feature_names,
         "feature_names": feature_builder.feature_names,
+        "removed_feature_names": feature_builder.removed_feature_names,
+        "keep_feature_mask": feature_builder.keep_feature_mask.astype(int).tolist(),
         "train_info": train_info,
         "selection_split": args.hybrid_select_split,
         "selection_metrics": select_metrics,
@@ -643,6 +723,12 @@ def parse_args():
     parser.add_argument("--structure_dir", default="", help="Optional final structure score dir; component dir may also be passed here.")
     parser.add_argument("--component_dir", default="", help="component_scores/<structure_id> dir containing dsh/dmh/shared/direct/structure_raw stores.")
     parser.add_argument("--output_root", default="results_hybrid_simplified")
+    parser.add_argument(
+        "--ablation",
+        choices=("none", "time", "direct", "shared", "structure", "cross", "meta"),
+        default="none",
+        help="Feature group to remove with a name-based mask after building the full simplified feature cube.",
+    )
     parser.add_argument("--query_batch_size", type=int, default=512)
     parser.add_argument("--hybrid_select_split", choices=("val", "test"), default="test")
     parser.add_argument("--rescue_topk", type=int, default=100)
