@@ -5,6 +5,7 @@ import json
 import os
 import os.path as osp
 import time
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -101,17 +102,102 @@ def require_component_score_store(root, splits):
         )
 
 
+def has_component_score_store(root, splits):
+    try:
+        require_component_score_store(root, splits)
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def infer_component_dir(args):
     if args.component_dir:
         return args.component_dir
     candidate = args.structure_dir
     if candidate and osp.isdir(osp.join(candidate, "train", "dsh")):
         return candidate
-    raise ValueError(
-        "--component_dir is required unless --structure_dir itself points to a "
-        "component_scores/<structure_id> directory. This simplified script does "
-        "not recompute dsh/dmh/direct/shared scores."
+    return osp.join(
+        args.component_output_root,
+        args.dataset,
+        f"seed{args.seed}",
+        "component_scores",
+        str(args.structure_id or "structure_args"),
     )
+
+
+def make_structure_args(args):
+    payload = {
+        "dataset": args.dataset,
+        "seed": int(args.seed),
+        "ns_q": int(args.ns_q),
+        "ns_seed": int(args.ns_seed),
+        "train_predict_ratio": float(args.train_predict_ratio),
+        "batch_size": int(args.structure_batch_size),
+        "query_batch_size": int(args.query_batch_size),
+        "max_events_in_single_batch": int(args.structure_max_events_in_single_batch),
+        "dict_mode": args.structure_dict_mode,
+        "shared_w": args.structure_shared_w,
+        "per_rel_use_mtrans": bool(args.structure_per_rel_use_mtrans),
+        "ppr_k": int(args.structure_ppr_k),
+        "top_k_relation": int(args.structure_top_k_relation),
+        "ppr_alpha": float(args.structure_ppr_alpha),
+        "ppr_beta": float(args.structure_ppr_beta),
+        "gamma": float(args.structure_gamma),
+        "direct_single_hop": float(args.structure_direct_single_hop),
+        "decay_direct": float(args.structure_decay_direct),
+        "top_share": int(args.structure_top_share),
+        "top_direct": int(args.structure_top_direct),
+        "decay_rel_trans": float(args.structure_decay_rel_trans),
+        "window_semantic_sim": float(args.structure_window_semantic_sim),
+        "window_trans": float(args.structure_window_trans),
+        "close_update_backward": bool(args.structure_close_update_backward),
+        "output_root": args.structure_output_root,
+        "source_join_threads": int(args.source_join_threads),
+        "source_join_log_batches": int(args.source_join_log_batches),
+        "dsh_log_bucket_stats": bool(args.dsh_log_bucket_stats),
+    }
+    from new_single_pipeline.structure_lgbm import BConfig
+
+    payload["b_cfg"] = BConfig(
+        mode=args.b_mode,
+        binary_unseen=float(args.b_binary_unseen),
+        continuous_alpha=float(args.b_continuous_alpha),
+    )
+    sargs = SimpleNamespace(**payload)
+    import train_new_structure as tns
+
+    if hasattr(tns, "normalize_args"):
+        tns.normalize_args(sargs)
+    return sargs
+
+
+def maybe_build_component_scores(args, data, splits):
+    component_dir = infer_component_dir(args)
+    if has_component_score_store(component_dir, splits):
+        print(f"[HybridSimplified][components] cache hit -> {component_dir}", flush=True)
+        return component_dir
+    if args.component_dir or (args.structure_dir and osp.isdir(osp.join(args.structure_dir, "train", "dsh"))):
+        require_component_score_store(component_dir, splits)
+        return component_dir
+    print(
+        f"[HybridSimplified][components] missing cache; generating structure component scores -> {component_dir}",
+        flush=True,
+    )
+    from new_single_pipeline.structure_lgbm import save_component_score_stores
+
+    component_parent = osp.dirname(osp.dirname(component_dir))
+    struct_id = osp.basename(osp.normpath(component_dir))
+    save_component_score_stores(
+        data,
+        make_structure_args(args),
+        "cpu",
+        component_parent,
+        struct_id,
+        splits=splits,
+        compute_metrics=not bool(args.skip_component_metrics),
+    )
+    require_component_score_store(component_dir, splits)
+    return component_dir
 
 
 def zscore_by_query(scores, valid):
@@ -613,6 +699,7 @@ def make_out_dir(args, component_dir):
 def validate_args(args):
     args.ablation = str(getattr(args, "ablation", "none") or "none").strip().lower().replace("-", "_")
     ablation_remove_names(args.ablation)
+    args.structure_id = str(getattr(args, "structure_id", "") or "structure_args")
     if int(args.query_batch_size) <= 0:
         raise ValueError("--query_batch_size must be > 0")
     if int(args.rescue_topk) <= 0:
@@ -630,13 +717,8 @@ def validate_args(args):
 def run(args):
     validate_args(args)
     set_random_seed(args.seed)
-    component_dir = infer_component_dir(args)
     splits = tuple(dict.fromkeys(("train", args.hybrid_select_split, "test")))
     require_flat_score_store(args.time_dir, "time_dir", splits)
-    require_component_score_store(component_dir, splits)
-
-    out_dir = ensure_dir(make_out_dir(args, component_dir))
-    print(f"[HybridSimplified] output -> {out_dir}", flush=True)
     print(
         f"[HybridSimplified] protocol={PROTOCOL} dataset={args.dataset} "
         f"ns_q={args.ns_q} select_split={args.hybrid_select_split} ablation={args.ablation}",
@@ -650,6 +732,9 @@ def run(args):
         ns_seed=args.ns_seed,
     )
     describe_loaded_data(data, prefix="[HybridSimplified]")
+    component_dir = maybe_build_component_scores(args, data, splits)
+    out_dir = ensure_dir(make_out_dir(args, component_dir))
+    print(f"[HybridSimplified] output -> {out_dir}", flush=True)
     if args.structure_dir and osp.isdir(args.structure_dir) and osp.isfile(osp.join(args.structure_dir, "test_pos.npy")):
         structure_metrics = evaluate_score_store(args.structure_dir, data, "test", args)
         print(f"[HybridSimplified][structure_raw_store] test {format_metrics(structure_metrics)}", flush=True)
@@ -722,6 +807,7 @@ def parse_args():
     parser.add_argument("--time_dir", required=True)
     parser.add_argument("--structure_dir", default="", help="Optional final structure score dir; component dir may also be passed here.")
     parser.add_argument("--component_dir", default="", help="component_scores/<structure_id> dir containing dsh/dmh/shared/direct/structure_raw stores.")
+    parser.add_argument("--component_output_root", default="results_hybrid_simplified_components")
     parser.add_argument("--output_root", default="results_hybrid_simplified")
     parser.add_argument(
         "--ablation",
@@ -748,6 +834,33 @@ def parse_args():
     parser.add_argument("--min_split_gain", type=float, default=0.001)
     parser.add_argument("--subsample", type=float, default=0.95)
     parser.add_argument("--colsample_bytree", type=float, default=0.85)
+    parser.add_argument("--structure_id", default="structure_args")
+    parser.add_argument("--structure_output_root", default="results_new_structure")
+    parser.add_argument("--structure_batch_size", type=int, default=4096)
+    parser.add_argument("--structure_max_events_in_single_batch", type=int, default=20000)
+    parser.add_argument("--structure_dict_mode", choices=("tag_sum", "tag_max", "per_rel"), default="tag_sum")
+    parser.add_argument("--structure_shared_w", choices=("dual_msim", "cross_msim", "unweighted"), default="dual_msim")
+    parser.add_argument("--structure_per_rel_use_mtrans", action="store_true", default=False)
+    parser.add_argument("--structure_ppr_k", type=int, default=1000)
+    parser.add_argument("--structure_top_k_relation", type=int, default=0)
+    parser.add_argument("--structure_ppr_alpha", type=float, default=0.03)
+    parser.add_argument("--structure_ppr_beta", type=float, default=0.9)
+    parser.add_argument("--structure_gamma", type=float, default=0.0)
+    parser.add_argument("--structure_direct_single_hop", type=float, default=1.0)
+    parser.add_argument("--structure_decay_direct", type=float, default=0.01)
+    parser.add_argument("--structure_top_share", type=int, default=100)
+    parser.add_argument("--structure_top_direct", type=int, default=-1)
+    parser.add_argument("--structure_decay_rel_trans", type=float, default=0.01)
+    parser.add_argument("--structure_window_semantic_sim", type=float, default=365.0)
+    parser.add_argument("--structure_window_trans", type=float, default=365.0)
+    parser.add_argument("--structure_close_update_backward", action="store_true", default=False)
+    parser.add_argument("--source_join_threads", type=int, default=60)
+    parser.add_argument("--source_join_log_batches", type=int, default=0)
+    parser.add_argument("--dsh_log_bucket_stats", action="store_true", default=False)
+    parser.add_argument("--b_mode", choices=("binary", "continuous"), default="continuous")
+    parser.add_argument("--b_binary_unseen", type=float, default=0.0)
+    parser.add_argument("--b_continuous_alpha", type=float, default=1e-4)
+    parser.add_argument("--skip_component_metrics", action="store_true", default=False)
     return parser.parse_args()
 
 
