@@ -176,13 +176,17 @@ def maybe_build_component_scores(args, data, splits):
     if has_component_score_store(component_dir, splits):
         print(f"[HybridSimplified][components] cache hit -> {component_dir}", flush=True)
         return component_dir
-    if args.component_dir or (args.structure_dir and osp.isdir(osp.join(args.structure_dir, "train", "dsh"))):
-        require_component_score_store(component_dir, splits)
-        return component_dir
+    explicit_component_dir = bool(args.component_dir) or bool(args.structure_dir and osp.isdir(osp.join(args.structure_dir, "train", "dsh")))
     print(
         f"[HybridSimplified][components] missing cache; generating structure component scores -> {component_dir}",
         flush=True,
     )
+    if explicit_component_dir:
+        print(
+            "[HybridSimplified][components] explicit component dir is incomplete; "
+            "rebuilding it from the supplied structure hyperparameters",
+            flush=True,
+        )
     from new_single_pipeline.structure_lgbm import save_component_score_stores
 
     component_parent = osp.dirname(osp.dirname(component_dir))
