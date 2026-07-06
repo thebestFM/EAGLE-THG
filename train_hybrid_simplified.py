@@ -48,6 +48,106 @@ META_FEATURE_NAMES = ("relation_is_inverse", "candidate_is_source")
 EPS = 1e-12
 
 
+def current_rss_mb():
+    try:
+        import psutil
+
+        return float(psutil.Process(os.getpid()).memory_info().rss) / (1024.0 * 1024.0)
+    except Exception:
+        return None
+
+
+def process_peak_rss_mb():
+    try:
+        import resource
+
+        peak = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if peak > 1024.0 * 1024.0:
+            return peak / (1024.0 * 1024.0)
+        return peak / 1024.0
+    except Exception:
+        return None
+
+
+def begin_resource_sample():
+    return {
+        "wall": time.perf_counter(),
+        "cpu": time.process_time(),
+        "rss_mb": current_rss_mb(),
+        "peak_rss_mb": process_peak_rss_mb(),
+    }
+
+
+def end_resource_sample(start):
+    wall = max(0.0, time.perf_counter() - float(start["wall"]))
+    cpu = max(0.0, time.process_time() - float(start["cpu"]))
+    rss_after = current_rss_mb()
+    peak_after = process_peak_rss_mb()
+    profile = {
+        "wall_sec": float(wall),
+        "process_cpu_sec": float(cpu),
+        "avg_cpu_cores": float(cpu / wall) if wall > 0.0 else 0.0,
+    }
+    if start.get("rss_mb") is not None:
+        profile["rss_before_mb"] = float(start["rss_mb"])
+    if rss_after is not None:
+        profile["rss_after_mb"] = float(rss_after)
+    if start.get("peak_rss_mb") is not None:
+        profile["process_peak_rss_before_mb"] = float(start["peak_rss_mb"])
+    if peak_after is not None:
+        profile["process_peak_rss_after_mb"] = float(peak_after)
+    return profile
+
+
+def empty_predict_profile():
+    return {
+        "wall_sec": 0.0,
+        "process_cpu_sec": 0.0,
+        "avg_cpu_cores": 0.0,
+        "predict_calls": 0,
+        "predicted_rows": 0,
+    }
+
+
+def add_predict_profile(acc, sample, rows):
+    acc["wall_sec"] += float(sample["wall_sec"])
+    acc["process_cpu_sec"] += float(sample["process_cpu_sec"])
+    acc["predict_calls"] += 1
+    acc["predicted_rows"] += int(rows)
+    if sample.get("rss_after_mb") is not None:
+        acc["rss_after_mb"] = max(float(acc.get("rss_after_mb", 0.0)), float(sample["rss_after_mb"]))
+    if sample.get("process_peak_rss_after_mb") is not None:
+        acc["process_peak_rss_after_mb"] = max(
+            float(acc.get("process_peak_rss_after_mb", 0.0)),
+            float(sample["process_peak_rss_after_mb"]),
+        )
+
+
+def finalize_predict_profile(acc):
+    wall = float(acc.get("wall_sec", 0.0))
+    cpu = float(acc.get("process_cpu_sec", 0.0))
+    acc["avg_cpu_cores"] = float(cpu / wall) if wall > 0.0 else 0.0
+    return acc
+
+
+def format_resource_profile(profile):
+    parts = [
+        f"wall={float(profile.get('wall_sec', 0.0)):.3f}s",
+        f"process_cpu={float(profile.get('process_cpu_sec', 0.0)):.3f}s",
+        f"avg_cpu_cores={float(profile.get('avg_cpu_cores', 0.0)):.2f}",
+    ]
+    if "rss_before_mb" in profile:
+        parts.append(f"rss_before={float(profile['rss_before_mb']):.1f}MB")
+    if "rss_after_mb" in profile:
+        parts.append(f"rss_after={float(profile['rss_after_mb']):.1f}MB")
+    if "process_peak_rss_after_mb" in profile:
+        parts.append(f"process_peak_rss={float(profile['process_peak_rss_after_mb']):.1f}MB")
+    if "predict_calls" in profile:
+        parts.append(f"predict_calls={int(profile.get('predict_calls', 0))}")
+        parts.append(f"predicted_rows={int(profile.get('predicted_rows', 0))}")
+    return " ".join(parts)
+
+
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
     return path
@@ -533,7 +633,7 @@ def build_train_matrix(data, args, feature_builder, time_dir, component_dir):
     )
 
 
-def fit_lgbm_ranker(X, y, group, feature_names, args):
+def fit_lgbm_ranker(X, y, group, feature_names, args, return_profile=False):
     try:
         import lightgbm as lgb
     except Exception as exc:
@@ -558,12 +658,17 @@ def fit_lgbm_ranker(X, y, group, feature_names, args):
         force_col_wise=True,
         verbose=-1,
     )
+    t_res = begin_resource_sample()
     model.fit(X, y, group=group.tolist(), feature_name=feature_names)
-    return model
+    profile = end_resource_sample(t_res)
+    return (model, profile) if return_profile else model
 
 
-def predict_lgbm(model, X):
+def predict_lgbm(model, X, profile=None):
+    t_res = begin_resource_sample() if profile is not None else None
     pred = model.predict(X).astype(np.float32, copy=False)
+    if profile is not None:
+        add_predict_profile(profile, end_resource_sample(t_res), len(X))
     if not np.all(np.isfinite(pred)):
         raise RuntimeError("LGBM produced non-finite predictions")
     return pred
@@ -586,6 +691,7 @@ def score_rescue_selected(raw_scores, selected, pred):
 
 def evaluate_model(data, split, args, feature_builder, model, time_dir, component_dir):
     sums = {}
+    predict_profile = empty_predict_profile()
     rescue_stats = {
         "pos_in_top10_before": 0,
         "pos_11_100_before": 0,
@@ -611,7 +717,7 @@ def evaluate_model(data, split, args, feature_builder, model, time_dir, componen
                 rescue_stats["pos_after_top100_before"] += 1
             if len(sel_cols):
                 X = block["features"][row, sel_cols, :].astype(np.float32, copy=False)
-                pred = predict_lgbm(model, X)
+                pred = predict_lgbm(model, X, profile=predict_profile)
                 final_scores = score_rescue_selected(raw_scores, selected[row], pred)
             else:
                 final_scores = raw_scores
@@ -638,6 +744,7 @@ def evaluate_model(data, split, args, feature_builder, model, time_dir, componen
     metrics = finalize_metric_sums(sums)
     metrics["num_queries"] = int(sums.get("count", 0))
     metrics["rescue_stats"] = rescue_stats
+    metrics["lgbm_predict_profile"] = finalize_predict_profile(predict_profile)
     return metrics
 
 
@@ -763,13 +870,29 @@ def run(args):
         f"rescue={train_info['rescue_queries']}",
         flush=True,
     )
-    model = fit_lgbm_ranker(X_train, y_train, group, feature_builder.feature_names, args)
+    model, lgbm_train_profile = fit_lgbm_ranker(
+        X_train,
+        y_train,
+        group,
+        feature_builder.feature_names,
+        args,
+        return_profile=True,
+    )
+    print(
+        f"[HybridSimplified][lgbm_train] {format_resource_profile(lgbm_train_profile)}",
+        flush=True,
+    )
     del X_train, y_train, group
     gc.collect()
 
     select_metrics = evaluate_model(data, args.hybrid_select_split, args, feature_builder, model, args.time_dir, component_dir)
     test_metrics = select_metrics if args.hybrid_select_split == "test" else evaluate_model(
         data, "test", args, feature_builder, model, args.time_dir, component_dir
+    )
+    test_predict_profile = test_metrics.get("lgbm_predict_profile", {})
+    print(
+        f"[HybridSimplified][test_lgbm_predict] {format_resource_profile(test_predict_profile)}",
+        flush=True,
     )
     model_path = osp.join(out_dir, "model.txt")
     save_lgbm_model(model, model_path)
@@ -787,9 +910,11 @@ def run(args):
         "removed_feature_names": feature_builder.removed_feature_names,
         "keep_feature_mask": feature_builder.keep_feature_mask.astype(int).tolist(),
         "train_info": train_info,
+        "lgbm_train_profile": lgbm_train_profile,
         "selection_split": args.hybrid_select_split,
         "selection_metrics": select_metrics,
         "test_metrics": test_metrics,
+        "test_lgbm_predict_profile": test_predict_profile,
         "model_path": model_path,
         "elapsed_s": time.time() - t0,
     }
