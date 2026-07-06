@@ -9,7 +9,6 @@
   },
   "time": {
     "id": "time_pair2",
-    "dir": "results_time_tkg_single/Yelp-BOI/seed42/rdf8faf93745b_topk100_mw10-30-80_ed96_hd160_bs1024_ebs256_neg8_samgroup_nsq1000_nss42_tpr0.3_abs1r0_gatechannel_rank1_lossmargin",
     "batch_size": 1024,
     "eval_batch_size": 256,
     "eval_neg_chunk": 64,
@@ -40,7 +39,7 @@
     "allow_tf32": true
   },
   "structure": {
-    "id": "structure_pair2",
+    "id": "structure_alpha005_beta09_gamma001_k2000",
     "batch_size": 4096,
     "max_events_in_single_batch": 20000,
     "dict_mode": "tag_sum",
@@ -48,8 +47,8 @@
     "per_rel_use_mtrans": false,
     "ppr_k": 2000,
     "top_k_relation": 0,
-    "ppr_alpha": 0.04014299418112063,
-    "ppr_beta": 0.9138768591888399,
+    "ppr_alpha": 0.05,
+    "ppr_beta": 0.9,
     "gamma": 0.01,
     "direct_single_hop": 0.9269715909367932,
     "decay_direct": 0.00600910557188908,
@@ -72,6 +71,16 @@
     "num_threads": 100,
     "b_mode": "continuous",
     "b_continuous_alpha": 0.000010261016119425031,
+    "n_estimators": 8,
+    "learning_rate": 0.03,
+    "num_leaves": 31,
+    "max_depth": 8,
+    "min_child_samples": 80,
+    "reg_lambda": 1.0,
+    "reg_alpha": 0.01,
+    "min_split_gain": 0.001,
+    "subsample": 0.95,
+    "colsample_bytree": 0.85,
     "skip_save_top10": true
   }
 }

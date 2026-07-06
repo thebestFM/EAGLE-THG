@@ -24,6 +24,7 @@ from utils import (
 
 
 PROTOCOL = "hybrid_simplified_no_recurrence_v1"
+BEST_HYPER_DIR = "best_hyper"
 COMPONENT_SCORE_NAMES = ("dsh", "dmh", "shared", "direct", "structure_raw")
 FEATURE_SUFFIXES = ("score", "z", "minmax", "rank_log", "rank_recip", "top10", "top50", "top100")
 SCORE_PREFIXES = ("structure_raw", "time", "dsh", "dmh", "direct", "shared", "base", "time_structure_base")
@@ -156,6 +157,158 @@ def ensure_dir(path):
 def stable_hash(payload, length=12):
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[: int(length)]
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def default_best_hyper_path(dataset):
+    return osp.join(BEST_HYPER_DIR, f"{dataset}.json")
+
+
+def apply_section(args, section, prefix="", dir_attr=None, id_attr=None):
+    for key, value in dict(section or {}).items():
+        if key == "dir" and dir_attr:
+            if not getattr(args, dir_attr, ""):
+                setattr(args, dir_attr, value)
+        elif key == "id" and id_attr:
+            setattr(args, id_attr, value)
+        else:
+            setattr(args, f"{prefix}{key}", value)
+
+
+def apply_best_hyper(args):
+    path = str(getattr(args, "best_hyper", "") or "").strip()
+    if not path:
+        return None
+    if path.lower() == "auto":
+        path = default_best_hyper_path(args.dataset)
+    if not osp.isfile(path):
+        raise FileNotFoundError(f"best_hyper file not found: {path}")
+    payload = load_json(path)
+    if payload.get("format") != "best_hyper_v1":
+        raise ValueError(f"unsupported best_hyper format in {path}: {payload.get('format')!r}")
+    if payload.get("dataset"):
+        args.dataset = str(payload["dataset"])
+    apply_section(args, payload.get("common", {}))
+    apply_section(args, payload.get("time", {}), prefix="time_", dir_attr="time_dir", id_attr="time_id")
+    apply_section(
+        args,
+        payload.get("structure", {}),
+        prefix="structure_",
+        dir_attr="structure_dir",
+        id_attr="structure_id",
+    )
+    apply_section(args, payload.get("hybrid", {}))
+    args.best_hyper = path
+    return payload
+
+
+def build_time_args(args):
+    values = {
+        "dataset": args.dataset,
+        "seed": int(args.seed),
+        "gpu": 0,
+        "output_dir": getattr(args, "time_dir", ""),
+        "force": False,
+        "batch_size": 1024,
+        "eval_batch_size": 256,
+        "eval_neg_chunk": 128,
+        "max_eval_pairs": 125000,
+        "stream_eval_batch_events": 32,
+        "eval_node_preload_chunk": 65536,
+        "max_eval_node_cache_mb": 4096.0,
+        "preload_eval_nodes": True,
+        "dense_eval_node_cache": True,
+        "cache_eval_source": False,
+        "eval_test": True,
+        "ns_q": int(args.ns_q),
+        "ns_seed": int(args.ns_seed),
+        "train_predict_ratio": float(args.train_predict_ratio),
+        "quick_val_events": 0,
+        "quick_val_fraction": 0.2,
+        "num_epochs": 20,
+        "patience": 4,
+        "selection_metric": "mrr",
+        "lr": 8e-4,
+        "weight_decay": 5e-5,
+        "train_num_neg": 8,
+        "stream_train_batch_events": 2048,
+        "hard_neg_ratio": 0.5,
+        "train_sampler": "grouped_exact",
+        "train_group_matrix_mb": 512.0,
+        "train_loss": "margin",
+        "rank_margin": 1.0,
+        "temperature": 1.0,
+        "grad_clip": 1.0,
+        "tolerance": 1e-8,
+        "curriculum_decay": 0.0,
+        "curriculum_raw_age": False,
+        "topk": 40,
+        "multi_windows": "10,40",
+        "time_dim": 64,
+        "rel_dim": 64,
+        "node_dim": 64,
+        "event_dim": 96,
+        "hidden_dim": 160,
+        "num_layers": 1,
+        "dropout": 0.15,
+        "time_min": 1.0,
+        "token_expansion_factor": 0.5,
+        "channel_expansion_factor": 4.0,
+        "use_single_layer": False,
+        "predictor_mode": "diag",
+        "event_encoder": "mixer",
+        "transformer_heads": 2,
+        "transformer_ff_dim": None,
+        "use_cross_history": False,
+        "cross_heads": 2,
+        "use_neighbor_id": True,
+        "use_abs_time": True,
+        "abs_time_periods": "7,30,180,365",
+        "abs_time_harmonics": 1,
+        "abs_time_use_raw": False,
+        "use_query_gate": True,
+        "query_gate_type": "channel",
+        "use_rank_pos": True,
+        "use_node_geo": None,
+        "thg_time_days": None,
+        "user_center_half_life_days": 365.0,
+        "no_retrain_on_train_prefix": False,
+        "reuse_no_retrain_full": True,
+        "profile_sync": False,
+        "use_amp": True,
+        "allow_tf32": True,
+        "time_ablation": "none",
+    }
+    for name in list(values):
+        attr = f"time_{name}"
+        if hasattr(args, attr):
+            values[name] = getattr(args, attr)
+    values["dataset"] = args.dataset
+    values["seed"] = int(args.seed)
+    values["ns_q"] = int(args.ns_q)
+    values["ns_seed"] = int(args.ns_seed)
+    values["train_predict_ratio"] = float(args.train_predict_ratio)
+
+    try:
+        import train_time
+
+        return train_time.normalize_args(SimpleNamespace(**values))
+    except Exception:
+        return SimpleNamespace(**values)
+
+
+def locate_time_dir(args):
+    if getattr(args, "time_dir", ""):
+        return str(args.time_dir)
+    try:
+        from new_single_pipeline import time as time_module
+    except Exception as exc:
+        raise RuntimeError("--time_dir is empty and time_module could not be imported to derive it") from exc
+    return time_module.get_out_dir(build_time_args(args))
 
 
 def split_snapshots(data, split):
@@ -823,9 +976,19 @@ def validate_args(args):
         raise ValueError("--hybrid_select_split must be val or test")
     if int(args.num_threads) <= 0:
         raise ValueError("--num_threads must be > 0")
+    cpu_count = os.cpu_count()
+    if cpu_count and int(args.num_threads) > int(cpu_count):
+        print(
+            f"[HybridSimplified] num_threads={args.num_threads} exceeds cpu_count={cpu_count}; "
+            f"using {cpu_count}",
+            flush=True,
+        )
+        args.num_threads = int(cpu_count)
 
 
 def run(args):
+    best_payload = apply_best_hyper(args)
+    args.time_dir = locate_time_dir(args)
     validate_args(args)
     set_random_seed(args.seed)
     splits = tuple(dict.fromkeys(("train", args.hybrid_select_split, "test")))
@@ -901,6 +1064,8 @@ def run(args):
         "protocol": PROTOCOL,
         "dataset": args.dataset,
         "args": vars(args).copy(),
+        "best_hyper": getattr(args, "best_hyper", ""),
+        "best_hyper_hash": stable_hash(best_payload, length=10) if best_payload is not None else "",
         "time_dir": args.time_dir,
         "structure_dir": args.structure_dir,
         "component_dir": component_dir,
@@ -933,7 +1098,9 @@ def parse_args():
     parser.add_argument("--ns_q", type=int, default=1000)
     parser.add_argument("--ns_seed", type=int, default=42)
     parser.add_argument("--train_predict_ratio", type=float, default=0.3)
-    parser.add_argument("--time_dir", required=True)
+    parser.add_argument("--best_hyper", default="", help="Path to best_hyper JSON, or 'auto' for best_hyper/<dataset>.json.")
+    parser.add_argument("--time_dir", default="", help="Explicit time score dir. If empty, derive it from best_hyper/time_* args.")
+    parser.add_argument("--time_id", default="")
     parser.add_argument("--structure_dir", default="", help="Optional final structure score dir; component dir may also be passed here.")
     parser.add_argument("--component_dir", default="", help="component_scores/<structure_id> dir containing dsh/dmh/shared/direct/structure_raw stores.")
     parser.add_argument("--component_output_root", default="results_hybrid_simplified_components")
